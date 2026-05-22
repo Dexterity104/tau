@@ -1899,7 +1899,7 @@ class TaskPoolTest(unittest.TestCase):
                 source="chain",
             )
 
-            def copied_round(*, task, king, challenger, config, duel_id, pool=None):
+            def copied_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
                 return validate.ValidationRoundResult(
                     task_name=task.task_name,
                     winner="challenger",
@@ -1976,7 +1976,7 @@ class TaskPoolTest(unittest.TestCase):
                 source="chain",
             )
 
-            def copied_round(*, task, king, challenger, config, duel_id, pool=None):
+            def copied_round(*, task, king, challenger, config, duel_id, pool=None, **_kwargs):
                 if task.task_name == "task-03":
                     time.sleep(1.0)
                 return validate.ValidationRoundResult(
@@ -2006,7 +2006,7 @@ class TaskPoolTest(unittest.TestCase):
                 )
 
         self.assertFalse(result.king_replaced)
-        self.assertEqual(result.disqualification_reason, "copy detected (3 near-exact rounds >= 0.98)")
+        self.assertEqual(result.disqualification_reason, "copy detected (6 near-exact rounds >= 0.98)")
         self.assertLess(len(result.rounds), 8)
         self.assertGreaterEqual(solve_round.call_count, 1)
         kill_containers.assert_called_once()
