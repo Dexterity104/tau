@@ -11,7 +11,6 @@ exec /home/const/subnet66/.venv/bin/python -m cli pool-manager \
   --poll-interval-seconds 10 \
   --task-pool-target 50 \
   --task-pool-static \
-  --task-pool-fill-from-saved \
   --task-archive-enabled \
   --task-archive-hf-dataset "$VALIDATE_TASK_ARCHIVE_HF_DATASET" \
   --task-archive-per-hour 10 \
