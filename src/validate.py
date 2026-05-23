@@ -15,6 +15,7 @@ import textwrap
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait as _futures_wait
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -85,7 +86,7 @@ _MIN_DUEL_TASKS = 50
 _COPY_MEAN_SIMILARITY_THRESHOLD = 0.90
 _COPY_NEAR_EXACT_SIMILARITY_THRESHOLD = 0.98
 _COPY_SUSPICIOUS_SIMILARITY_THRESHOLD = 0.92
-_COPY_NEAR_EXACT_MIN_ROUNDS = 3
+_COPY_NEAR_EXACT_MIN_ROUNDS = 6
 _COPY_SUSPICIOUS_FRACTION_THRESHOLD = 0.60
 _POOL_SOLVE_TIMEOUT_SECONDS = 300
 _MIN_POOL_BASELINE_LINES = 1
@@ -1993,6 +1994,12 @@ def _truncate_middle(text: str, max_chars: int) -> str:
 # Task pool
 # ---------------------------------------------------------------------------
 
+def _pool_task_has_baseline_artifacts(task: PoolTask) -> bool:
+    task_root = Path(task.task_root)
+    baseline_dir = task_root / "solutions" / "baseline"
+    return (baseline_dir / "solve.json").is_file() and (baseline_dir / "solution.diff").is_file()
+
+
 class TaskPool:
     """Thread-safe pool of pre-solved tasks shared across all duels.
 
@@ -2092,6 +2099,16 @@ class TaskPool:
         ``min_block`` is kept for call-site compatibility but no longer filters
         cached tasks; a restart should be able to use the persisted pool.
         """
+        tasks = self.take_many(min_block=min_block, limit=1, exclude=exclude)
+        return tasks[0] if tasks else None
+
+    def take_many(
+        self,
+        min_block: int,
+        limit: int,
+        exclude: set[str] | None = None,
+    ) -> list[PoolTask]:
+        """Return up to *limit* usable pool tasks without removing them."""
         excluded = exclude or set()
         with self._lock:
             candidates: list[PoolTask] = []
@@ -2102,21 +2119,14 @@ class TaskPool:
                     if task_name in excluded:
                         continue
                     task = PoolTask.from_dict(d)
-                    task_root = Path(task.task_root)
-                    baseline_dir = task_root / "solutions" / "baseline"
-                    if not (
-                        (baseline_dir / "solve.json").is_file()
-                        and (baseline_dir / "solution.diff").is_file()
-                    ):
+                    if not _pool_task_has_baseline_artifacts(task):
                         p.unlink(missing_ok=True)
                         continue
                     candidates.append(task)
                 except Exception:
                     p.unlink(missing_ok=True)
-            if candidates:
-                candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
-                return candidates[0]
-            return None
+            candidates.sort(key=lambda task: (task.cursor_elapsed, task.task_name))
+            return candidates[: max(0, int(limit))]
 
     # Keep pop() for backward compat (used by nothing now, but safe to have)
     def pop(self, min_block: int) -> PoolTask | None:
@@ -2449,6 +2459,21 @@ def _cached_solution_agent_timeout_seconds(
 # Pool filler (background thread)
 # ---------------------------------------------------------------------------
 
+_POOL_FILLER_WORKER_OVERSUBSCRIBE = 1
+
+
+def _pool_filler_worker_count(config: RunConfig) -> int:
+    return max(1, int(config.validate_pool_filler_concurrency)) * _POOL_FILLER_WORKER_OVERSUBSCRIBE
+
+
+def _pool_filler_executor_workers(config: RunConfig) -> int:
+    return _pool_filler_worker_count(config) * 2
+
+
+def _pool_solve_slot(pool_solve_semaphore: threading.Semaphore | None):
+    return pool_solve_semaphore if pool_solve_semaphore is not None else nullcontext()
+
+
 def _pool_filler_loop(
     config: RunConfig,
     state: ValidatorState,
@@ -2458,6 +2483,7 @@ def _pool_filler_loop(
     pool_starved: threading.Event | None = None,
     pool_refresh: TaskPoolRefreshBudget | None = None,
     pool_label: str = "primary",
+    pool_solve_semaphore: threading.Semaphore | None = None,
 ) -> None:
     while not stop_event.is_set():
         refresh_claimed = False
@@ -2567,11 +2593,12 @@ def _pool_filler_loop(
             if cached_baseline is None:
                 _remove_solution_artifacts(task_name=task_name, solution_name="baseline", config=config)
                 baseline_cfg = replace(_build_baseline_config(config), agent_timeout=_POOL_SOLVE_TIMEOUT_SECONDS)
-                baseline_result = solve_task_run(
-                    task_name=task_name,
-                    solution_name="baseline",
-                    config=baseline_cfg,
-                )
+                with _pool_solve_slot(pool_solve_semaphore):
+                    baseline_result = solve_task_run(
+                        task_name=task_name,
+                        solution_name="baseline",
+                        config=baseline_cfg,
+                    )
                 baseline_exit_reason = baseline_result.exit_reason
                 baseline_elapsed = baseline_result.elapsed_seconds
             else:
@@ -2601,7 +2628,8 @@ def _pool_filler_loop(
             _remove_compare_artifacts(task_name=task_name, solution_names=["king", "baseline"], config=config)
             king_cfg = replace(_build_agent_config(config, king), agent_timeout=agent_timeout)
             try:
-                king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
+                with _pool_solve_slot(pool_solve_semaphore):
+                    king_result = solve_task_run(task_name=task_name, solution_name="king", config=king_cfg)
             except Exception as exc:
                 log.info(
                     "Pool filler[%s]: king solve failed for %s; using empty king patch: %s",
@@ -3376,10 +3404,10 @@ def _gather_pool_tasks(
                 on_tick(gathered=len(tasks), needed=n)
             except Exception:
                 log.exception("gather on_tick callback failed (non-fatal)")
-        task = pool.take(min_block=min_block, exclude=seen)
-        if task is not None:
-            tasks.append(task)
-            seen.add(task.task_name)
+        batch = pool.take_many(min_block=min_block, limit=n - len(tasks), exclude=seen)
+        if batch:
+            tasks.extend(batch)
+            seen.update(task.task_name for task in batch)
             last_progress = time.monotonic()
         else:
             if pool_starved is not None:
@@ -3403,11 +3431,46 @@ def _gather_pool_tasks(
                 len(tasks), n, elapsed_no_progress, starve_grace,
             )
             break
-        if task is None:
+        if not batch:
             time.sleep(min(3, remaining_time))
     if pool_starved is not None:
         pool_starved.clear()
     return _order_duel_tasks_for_submission(tasks)
+
+
+def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]:
+    return {
+        "task_name": round_result.task_name,
+        "winner": round_result.winner,
+        "king_lines": round_result.king_lines,
+        "challenger_lines": round_result.challenger_lines,
+        "king_score": round_result.king_score,
+        "challenger_score": round_result.challenger_score,
+        "king_llm_score": round_result.king_llm_score,
+        "challenger_llm_score": round_result.challenger_llm_score,
+        "llm_judge_winner": round_result.llm_judge_winner,
+        "king_exit_reason": round_result.king_exit_reason,
+        "challenger_exit_reason": round_result.challenger_exit_reason,
+        "king_agent_timeout_seconds": round_result.king_agent_timeout_seconds,
+        "challenger_agent_timeout_seconds": round_result.challenger_agent_timeout_seconds,
+        "king_similarity_ratio": round_result.king_similarity_ratio,
+        "challenger_similarity_ratio": round_result.challenger_similarity_ratio,
+        "king_challenger_similarity": round_result.king_challenger_similarity,
+    }
+
+
+def _active_rounds_payload(
+    rounds: Sequence[ValidationRoundResult],
+    published_artifact_task_names: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    scored_payloads = [_active_round_payload(round_result) for round_result in rounds if round_result.scored]
+    scored_task_names = {str(item.get("task_name") or "") for item in scored_payloads}
+    pending_payloads = [
+        {"task_name": task_name, "winner": "pending", "artifact_published": True}
+        for task_name in published_artifact_task_names
+        if task_name and task_name not in scored_task_names
+    ]
+    return [*scored_payloads, *pending_payloads]
 
 
 def _solve_and_compare_round(
@@ -3418,6 +3481,7 @@ def _solve_and_compare_round(
     config: RunConfig,
     duel_id: int,
     pool: TaskPool | None = None,
+    on_artifacts_published: Any | None = None,
 ) -> ValidationRoundResult:
     """Run a single round: solve challenger, then compare. Thread-safe."""
     solution_label = f"challenger-{challenger.uid}-d{duel_id}"
@@ -3544,7 +3608,7 @@ def _solve_and_compare_round(
         )
 
         try:
-            publish_round_data(
+            published = publish_round_data(
                 duel_id=duel_id, task_name=task.task_name,
                 tasks_root=config.tasks_root,
                 solution_labels={
@@ -3552,6 +3616,8 @@ def _solve_and_compare_round(
                     "challenger": solution_label,
                 },
             )
+            if published and on_artifacts_published is not None:
+                on_artifacts_published(task.task_name)
         except Exception:
             log.exception("R2 round publish failed (non-fatal)")
 
@@ -3724,6 +3790,9 @@ def _run_parallel_duel(
 
     rounds: list[ValidationRoundResult] = list(resume_rounds)
     completed_task_names = {round_result.task_name for round_result in rounds}
+    published_artifact_task_names: list[str] = []
+    published_artifact_task_set: set[str] = set()
+    progress_lock = threading.Lock()
     duel_deadline = time.monotonic() + _PARALLEL_DUEL_HARD_TIMEOUT
     last_progress_at = time.monotonic()
     last_heartbeat_at = time.monotonic()
@@ -3758,7 +3827,8 @@ def _run_parallel_duel(
         try:
             on_round_complete(
                 duel_id=duel_id, wins=wins, losses=losses, ties=ties,
-                scored=scored, threshold=dyn_threshold, rounds=rounds,
+                scored=scored, threshold=dyn_threshold, rounds=list(rounds),
+                artifact_task_names=list(published_artifact_task_names),
                 phase="running_rounds",
                 gathered_tasks=len(tasks),
                 needed_tasks=n_rounds,
@@ -3768,6 +3838,13 @@ def _run_parallel_duel(
             log.exception("on_round_complete callback failed (non-fatal)")
 
     try:
+        def _note_artifacts_published(task_name: str) -> None:
+            with progress_lock:
+                if task_name not in published_artifact_task_set:
+                    published_artifact_task_set.add(task_name)
+                    published_artifact_task_names.append(task_name)
+            _emit_progress()
+
         task_queue = [task for task in tasks if task.task_name not in completed_task_names]
         futures: dict[Any, PoolTask] = {}
         pending: set[Any] = set()
@@ -3787,6 +3864,7 @@ def _run_parallel_duel(
                     config=config,
                     duel_id=duel_id,
                     pool=pool,
+                    on_artifacts_published=_note_artifacts_published,
                 )
                 futures[future] = task
                 pending.add(future)
@@ -4307,8 +4385,9 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     log.exception("Queue refresh dashboard publish failed (non-fatal)")
         return current_block
 
+    pool_solve_slots = threading.BoundedSemaphore(max(1, int(config.validate_pool_filler_concurrency)))
     pool_filler_executor = ThreadPoolExecutor(
-        max_workers=max(1, config.validate_pool_filler_concurrency) * 2,
+        max_workers=_pool_filler_executor_workers(config),
     )
     previous_signal_handlers: dict[int, Any] = {}
 
@@ -4435,7 +4514,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 )
 
             # Start pool fillers
-            for _ in range(config.validate_pool_filler_concurrency):
+            for _ in range(_pool_filler_worker_count(config)):
                 pool_filler_executor.submit(
                     _pool_filler_loop,
                     config,
@@ -4446,6 +4525,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     pool_starved,
                     pool_refresh,
                     "primary",
+                    pool_solve_slots,
                 )
                 pool_filler_executor.submit(
                     _pool_filler_loop,
@@ -4457,6 +4537,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     retest_pool_starved,
                     retest_pool_refresh,
                     "retest",
+                    pool_solve_slots,
                 )
 
             while not shutdown_requested.is_set():
@@ -4717,22 +4798,14 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     "status": phase,
                                     "wins": wins, "losses": losses, "ties": ties,
                                     "scored": scored,
-                                    "rounds": [{"task_name": r.task_name, "winner": r.winner,
-                                                "king_lines": r.king_lines, "challenger_lines": r.challenger_lines,
-                                                "king_score": r.king_score,
-                                                "challenger_score": r.challenger_score,
-                                                "king_llm_score": r.king_llm_score,
-                                                "challenger_llm_score": r.challenger_llm_score,
-                                                "llm_judge_winner": r.llm_judge_winner,
-                                                "king_exit_reason": r.king_exit_reason,
-                                                "challenger_exit_reason": r.challenger_exit_reason,
-                                                "king_agent_timeout_seconds": r.king_agent_timeout_seconds,
-                                                "challenger_agent_timeout_seconds": r.challenger_agent_timeout_seconds,
-                                                "king_similarity_ratio": r.king_similarity_ratio,
-                                                "challenger_similarity_ratio": r.challenger_similarity_ratio,
-                                                "king_challenger_similarity": r.king_challenger_similarity}
-                                               for r in rounds if r.scored],
+                                    "rounds": _active_rounds_payload(
+                                        rounds,
+                                        kw.get("artifact_task_names") if isinstance(kw.get("artifact_task_names"), list) else (),
+                                    ),
                                 }
+                                artifact_count = len(active_duel_info["rounds"])
+                                if artifact_count > scored:
+                                    active_duel_info["published_round_count"] = artifact_count
                                 for key in ("gathered_tasks", "needed_tasks", "pool_size", "pause_reason", "status_message"):
                                     if key in kw:
                                         active_duel_info[key] = kw[key]
