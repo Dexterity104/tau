@@ -31,6 +31,14 @@ _POOL_FILL_ADD_LOCK = threading.Lock()
 _POOL_FILLER_WORKER_OVERSUBSCRIBE = 3
 _ARCHIVE_UPLOAD_COMPLETE_STATUSES = {"uploaded_delete_pending", "uploaded_deleted"}
 _ARCHIVE_UPLOAD_RETRY_STATUSES = {"pool_inserted", "upload_failed"}
+_ARCHIVE_QUOTA_USED_STATUSES = {
+    "archive_reserved",
+    "archive_generation_skipped",
+    "pool_inserted",
+    "upload_failed",
+    "uploaded_delete_pending",
+    "uploaded_deleted",
+}
 
 
 @dataclass(slots=True)
@@ -125,26 +133,24 @@ def task_archive_jsonl_path(pool_label: str, hour: str) -> str:
     return f"tasks/{safe_pool_label(pool_label)}/{hour}.jsonl"
 
 
-def archive_quota_used(ledger: dict[str, Any], *, pool_label: str, hour: str) -> int:
-    used_statuses = {"archive_reserved", "pool_inserted", "upload_failed", "uploaded_delete_pending", "uploaded_deleted"}
+def archive_quota_used(ledger: dict[str, Any], *, hour: str) -> int:
     return sum(
         1
         for item in (ledger.get("tasks") or {}).values()
         if (
             isinstance(item, dict)
-            and item.get("pool_label") == pool_label
             and item.get("archive_hour") == hour
-            and item.get("status") in used_statuses
+            and item.get("status") in _ARCHIVE_QUOTA_USED_STATUSES
         )
     )
 
 
-def archive_quota_remaining(config: RunConfig, *, pool_label: str, hour: str | None = None) -> int:
+def archive_quota_remaining(config: RunConfig, *, pool_label: str | None = None, hour: str | None = None) -> int:
     per_hour = max(0, int(config.validate_task_archive_per_hour))
     if per_hour <= 0:
         return 0
     ledger = load_task_archive_ledger(task_archive_ledger_path(config))
-    return max(0, per_hour - archive_quota_used(ledger, pool_label=pool_label, hour=hour or archive_hour()))
+    return max(0, per_hour - archive_quota_used(ledger, hour=hour or archive_hour()))
 
 
 def reserve_archive_quota(
@@ -161,7 +167,7 @@ def reserve_archive_quota(
     hour_value = hour or archive_hour()
     with _TASK_ARCHIVE_LOCK:
         ledger = load_task_archive_ledger(ledger_path)
-        if archive_quota_used(ledger, pool_label=pool_label, hour=hour_value) >= per_hour:
+        if archive_quota_used(ledger, hour=hour_value) >= per_hour:
             return None
         tasks = dict(ledger.get("tasks") or {})
         updated = {
@@ -190,7 +196,8 @@ def release_archive_reservation(*, config: RunConfig, task_name: str | None) -> 
         tasks = dict(ledger.get("tasks") or {})
         entry = tasks.get(task_name)
         if isinstance(entry, dict) and entry.get("status") == "archive_reserved":
-            tasks.pop(task_name, None)
+            updated = {**entry, "status": "archive_generation_skipped", "updated_at": v._timestamp()}
+            tasks[task_name] = updated
             ledger["tasks"] = tasks
             write_task_archive_ledger(ledger_path, ledger)
 
@@ -232,7 +239,7 @@ def pool_should_prepare_task(
     remaining = archive_quota_remaining(config, pool_label=pool_label)
     if remaining <= 0:
         return False, f"{reason}; hourly archive quota exhausted", False
-    return True, f"{reason}; hourly archive rotation quota remaining={remaining}", True
+    return True, f"{reason}; hourly archive generation quota remaining={remaining}", True
 
 
 def record_task_archive_status(
@@ -795,7 +802,7 @@ def _prepare_one_task_for_pool(
             if archive_rotation:
                 reservation = reserve_archive_quota(config=config, task_name=task_name, pool_label=pool_label)
                 if reservation is None:
-                    log.info("Pool manager[%s]: hourly archive quota exhausted before generating %s", pool_label, task_name)
+                    log.info("Pool manager[%s]: hourly archive generation quota exhausted before generating %s", pool_label, task_name)
                     return False
                 archive_reservation_name = task_name
                 archive_reservation_hour = str(reservation["archive_hour"])
@@ -807,7 +814,7 @@ def _prepare_one_task_for_pool(
         if archive_rotation and archive_reservation_name is None:
             reservation = reserve_archive_quota(config=config, task_name=task_name, pool_label=pool_label)
             if reservation is None:
-                log.info("Pool manager[%s]: hourly archive quota exhausted before preparing %s", pool_label, task_name)
+                log.info("Pool manager[%s]: hourly archive generation quota exhausted before preparing %s", pool_label, task_name)
                 return False
             archive_reservation_name = task_name
             archive_reservation_hour = str(reservation["archive_hour"])

@@ -91,7 +91,7 @@ class TaskPoolManagerTest(unittest.TestCase):
 
         self.assertTrue(entered)
 
-    def test_archive_quota_is_per_pool_and_hour(self):
+    def test_archive_quota_is_global_per_hour(self):
         with tempfile.TemporaryDirectory() as td:
             config = RunConfig(workspace_root=Path(td), validate_task_archive_per_hour=2)
             for name, pool_label, hour in (
@@ -108,10 +108,10 @@ class TaskPoolManagerTest(unittest.TestCase):
                 )
 
             self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-01"), 0)
-            self.assertEqual(manager.archive_quota_remaining(config, pool_label="retest", hour="2026-05-22-01"), 1)
+            self.assertEqual(manager.archive_quota_remaining(config, pool_label="retest", hour="2026-05-22-01"), 0)
             self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-02"), 2)
 
-    def test_archive_quota_reservation_blocks_parallel_rotation_work(self):
+    def test_archive_quota_reservation_consumes_generation_attempt(self):
         with tempfile.TemporaryDirectory() as td:
             config = RunConfig(workspace_root=Path(td), validate_task_archive_per_hour=1)
 
@@ -135,7 +135,9 @@ class TaskPoolManagerTest(unittest.TestCase):
 
             manager.release_archive_reservation(config=config, task_name="validate-20260101000000-000001")
 
-            self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-01"), 1)
+            self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-01"), 0)
+            ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
+            self.assertEqual(ledger["tasks"]["validate-20260101000000-000001"]["status"], "archive_generation_skipped")
 
     def test_select_rotation_archive_task_skips_replacement_and_leases(self):
         with tempfile.TemporaryDirectory() as td:
@@ -182,7 +184,7 @@ class TaskPoolManagerTest(unittest.TestCase):
 
             self.assertTrue(should_prepare)
             self.assertTrue(archive_rotation)
-            self.assertIn("hourly archive rotation quota remaining=1", reason)
+            self.assertIn("hourly archive generation quota remaining=1", reason)
 
             manager.record_task_archive_status(
                 config=config,
