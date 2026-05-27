@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
+import hashlib
 from dataclasses import asdict, dataclass
 from urllib.parse import urlencode
 
@@ -19,8 +20,12 @@ log = logging.getLogger("swe-eval.github_miner")
 _RATE_LIMIT_COOLDOWN = 60  # seconds to wait before reusing a rate-limited token
 
 
+def _token_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
+
+
 class GitHubTokenRotator:
-    """Thread-safe round-robin over multiple GitHub PATs with rate-limit tracking."""
+    """Thread-safe round-robin over GitHub PATs with rate-limit and 401 tracking."""
 
     def __init__(self, tokens: list[str]) -> None:
         if not tokens:
@@ -29,6 +34,8 @@ class GitHubTokenRotator:
         self._index = 0
         self._lock = threading.Lock()
         self._cooldowns: dict[int, float] = {}
+        self._disabled: set[int] = set()
+        self._all_tokens_disabled_logged = False
         log.info("Token rotator initialised with %d token(s)", len(self._tokens))
 
     @classmethod
@@ -45,22 +52,39 @@ class GitHubTokenRotator:
         return len(self._tokens)
 
     def get_token(self) -> str:
-        """Return the next available token. Blocks if all tokens are cooling down."""
+        """Return the next available token. Blocks if all active tokens are cooling down."""
         with self._lock:
+            active_count = self.active_count
+            if active_count == 0:
+                if not self._all_tokens_disabled_logged:
+                    self._all_tokens_disabled_logged = True
+                    log.error(
+                        "All %d GitHub tokens were disabled after HTTP 401; using unauthenticated requests",
+                        len(self._tokens),
+                    )
+                return ""
+            self._all_tokens_disabled_logged = False
+
             n = len(self._tokens)
             now = time.monotonic()
 
             for _ in range(n):
                 idx = self._index % n
                 self._index += 1
+                if idx in self._disabled:
+                    continue
                 ready_at = self._cooldowns.get(idx, 0)
                 if now >= ready_at:
                     return self._tokens[idx]
 
-            earliest = min(self._cooldowns.values())
+            active_cooldowns = [
+                ready_at for idx, ready_at in self._cooldowns.items()
+                if idx not in self._disabled
+            ]
+            earliest = min(active_cooldowns)
             wait = max(0, earliest - now)
 
-        log.warning("All %d GitHub tokens rate-limited; sleeping %.0fs", n, wait)
+        log.warning("All %d active GitHub tokens rate-limited; sleeping %.0fs", active_count, wait)
         time.sleep(wait)
         return self.get_token()
 
@@ -71,11 +95,43 @@ class GitHubTokenRotator:
                 idx = self._tokens.index(token)
             except ValueError:
                 return
+            if idx in self._disabled:
+                return
             self._cooldowns[idx] = time.monotonic() + _RATE_LIMIT_COOLDOWN
-            log.info("Token #%d rate-limited, cooldown %ds (%d/%d on cooldown)",
-                     idx, _RATE_LIMIT_COOLDOWN,
-                     sum(1 for v in self._cooldowns.values() if v > time.monotonic()),
-                     len(self._tokens))
+            log.info(
+                "Token #%d rate-limited, cooldown %ds (%d/%d active on cooldown)",
+                idx + 1,
+                _RATE_LIMIT_COOLDOWN,
+                sum(
+                    1 for token_idx, ready_at in self._cooldowns.items()
+                    if token_idx not in self._disabled and ready_at > time.monotonic()
+                ),
+                self.active_count,
+            )
+
+    def mark_unauthorized(self, token: str) -> None:
+        """Permanently disable *token* after GitHub rejects it with HTTP 401."""
+        with self._lock:
+            try:
+                idx = self._tokens.index(token)
+            except ValueError:
+                return
+            if idx in self._disabled:
+                return
+            self._disabled.add(idx)
+            self._cooldowns.pop(idx, None)
+            remaining = len(self._tokens) - len(self._disabled)
+            fingerprint = _token_fingerprint(token)
+        log.warning(
+            "GitHub token #%d (%s) disabled after HTTP 401; %d token(s) remain",
+            idx + 1,
+            fingerprint,
+            remaining,
+        )
+
+    @property
+    def active_count(self) -> int:
+        return len(self._tokens) - len(self._disabled)
 
 
 @dataclass(slots=True)
@@ -390,7 +446,8 @@ class GitHubMiner:
             request_headers: dict[str, str] = {}
             if self._rotator:
                 used_token = self._rotator.get_token()
-                request_headers["Authorization"] = f"Bearer {used_token}"
+                if used_token:
+                    request_headers["Authorization"] = f"Bearer {used_token}"
             response = self._client.get(path, params=params or None, headers=request_headers or None)
             response.raise_for_status()
             payload = response.json()
@@ -398,6 +455,9 @@ class GitHubMiner:
                 return response, payload
             return payload
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401 and self._rotator and used_token:
+                self._rotator.mark_unauthorized(used_token)
+                return self._get_json(path, return_response=return_response, **params)
             if exc.response.status_code == 403:
                 if self._rotator and used_token:
                     self._rotator.mark_rate_limited(used_token)

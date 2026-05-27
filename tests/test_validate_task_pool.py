@@ -578,6 +578,74 @@ class TaskPoolTest(unittest.TestCase):
             self.assertEqual(removed, 2)
             self.assertEqual(pool.size(), 0)
 
+
+    def test_static_pool_archives_prior_king_tasks_before_transition_flush(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pool = TaskPool(root / "pool")
+            task_root = root / "tasks" / "validate-20260101000000-000001"
+            self._write_minimal_task_metadata(task_root)
+            task = PoolTask(
+                task_name="validate-20260101000000-000001",
+                task_root=str(task_root),
+                creation_block=1,
+                cursor_elapsed=10.0,
+                king_lines=1,
+                king_similarity=0.1,
+                baseline_lines=1,
+                king_hotkey="old-hotkey",
+                king_commit_sha="a" * 40,
+            )
+            pool.add(task)
+            old_king = validate.ValidatorSubmission(
+                hotkey="old-hotkey",
+                uid=1,
+                repo_full_name="unarbos/ninja",
+                repo_url="https://github.com/unarbos/ninja",
+                commit_sha="a" * 40,
+                commitment="unarbos/ninja@" + "a" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+            new_king = validate.ValidatorSubmission(
+                hotkey="new-hotkey",
+                uid=2,
+                repo_full_name="unarbos/ninja",
+                repo_url="https://github.com/unarbos/ninja",
+                commit_sha="b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
+                commitment_block=2,
+                source="chain",
+            )
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_static=True,
+                validate_task_archive_enabled=True,
+                validate_task_archive_hf_dataset="owner/dataset",
+            )
+            validate._save_state(config.validate_root / "state.json", validate.ValidatorState(current_king=old_king))
+
+            with patch.dict("os.environ", {"HF_TOKEN": "token"}), patch(
+                "task_pool_manager.append_hf_dataset_jsonl",
+                return_value=SimpleNamespace(commit_url="https://hf/commit"),
+            ) as upload:
+                removed = validate._flush_static_pool_if_stale_for_king(
+                    config=config,
+                    pool=pool,
+                    king=new_king,
+                    pool_label="primary",
+                    archive_stale=True,
+                    stale_king=old_king,
+                )
+
+            self.assertEqual(removed, 1)
+            self.assertEqual(pool.size(), 0)
+            self.assertEqual(upload.call_count, 1)
+            row = upload.call_args.kwargs["row"]
+            self.assertEqual(row["archive_reason"], "king_transition")
+            self.assertEqual(row["pool_label"], "king-transition-primary")
+            self.assertEqual(row["king"]["hotkey"], "old-hotkey")
+
     def test_static_pool_ready_requires_exact_target_for_current_king(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1250,6 +1318,74 @@ class TaskPoolTest(unittest.TestCase):
             self.assertTrue((config.tasks_root / healthy_name / "solutions" / "king").exists())
             self.assertFalse((config.tasks_root / unhealthy_name / "solutions" / "king").exists())
             self.assertFalse((config.tasks_root / stray_name / "solutions" / "king").exists())
+
+    def test_prune_preserves_pending_king_transition_archive_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(
+                workspace_root=root,
+                validate_task_pool_static=True,
+            )
+            primary = TaskPool(root / "primary")
+            retest = TaskPool(root / "retest")
+            king = validate.ValidatorSubmission(
+                hotkey="new-hotkey",
+                uid=1,
+                repo_full_name="unarbos/ninja",
+                repo_url="https://github.com/unarbos/ninja",
+                commit_sha="b" * 40,
+                commitment="unarbos/ninja@" + "b" * 40,
+                commitment_block=1,
+                source="chain",
+            )
+            task_name = "validate-20260101000000-000004"
+            self._write_healthy_king_cache(
+                config=config,
+                task_name=task_name,
+                king_lines=12,
+                king_similarity=0.25,
+                baseline_lines=48,
+            )
+            primary.add(
+                PoolTask(
+                    task_name=task_name,
+                    task_root=str(config.tasks_root / task_name),
+                    creation_block=1,
+                    cursor_elapsed=10.0,
+                    king_lines=12,
+                    king_similarity=0.25,
+                    baseline_lines=48,
+                    king_hotkey="old-hotkey",
+                    king_commit_sha="a" * 40,
+                )
+            )
+
+            import task_pool_manager as manager
+
+            manager.record_task_archive_status(
+                config=config,
+                task_name=task_name,
+                pool_label="king-transition-primary",
+                status="upload_failed",
+                archive_hour_value="2026-05-26-18",
+                hf_path="tasks/king-transition-primary/2026-05-26-18.jsonl",
+                error="temporary upload failure",
+                archive_reason="king_transition",
+            )
+
+            counts = validate._prune_king_cache_to_current_pools(
+                config=config,
+                king=king,
+                pool=primary,
+                retest_pool=retest,
+                pool_starved=threading.Event(),
+                retest_pool_starved=threading.Event(),
+            )
+
+            self.assertEqual(primary.size(), 1)
+            self.assertEqual(primary.list_tasks()[0].task_name, task_name)
+            self.assertEqual(counts["dropped_primary_pool_tasks"], 0)
+            self.assertTrue((config.tasks_root / task_name / "solutions" / "king").exists())
 
     def test_take_respects_exclude_when_sorting_by_speed(self):
         with tempfile.TemporaryDirectory() as td:
