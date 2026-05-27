@@ -33,7 +33,6 @@ _ARCHIVE_UPLOAD_COMPLETE_STATUSES = {"uploaded_delete_pending", "uploaded_delete
 _ARCHIVE_UPLOAD_RETRY_STATUSES = {"pool_inserted", "upload_failed"}
 _ARCHIVE_QUOTA_USED_STATUSES = {
     "archive_reserved",
-    "archive_generation_skipped",
     "pool_inserted",
     "upload_failed",
     "uploaded_delete_pending",
@@ -141,6 +140,7 @@ def archive_quota_used(ledger: dict[str, Any], *, hour: str) -> int:
             isinstance(item, dict)
             and item.get("archive_hour") == hour
             and item.get("status") in _ARCHIVE_QUOTA_USED_STATUSES
+            and item.get("archive_reason") != "king_transition"
         )
     )
 
@@ -251,6 +251,7 @@ def record_task_archive_status(
     archive_hour_value: str | None = None,
     hf_path: str | None = None,
     error: str | None = None,
+    archive_reason: str | None = None,
 ) -> dict[str, Any]:
     ledger_path = task_archive_ledger_path(config)
     with _TASK_ARCHIVE_LOCK:
@@ -266,6 +267,8 @@ def record_task_archive_status(
             "status": status,
             "updated_at": v._timestamp(),
         }
+        if archive_reason is not None:
+            updated["archive_reason"] = archive_reason
         updated.setdefault("created_at", updated["updated_at"])
         if hf_path is not None:
             updated["hf_path"] = hf_path
@@ -317,6 +320,7 @@ def task_archive_jsonl_row(
     pool_label: str,
     archive_hour_value: str,
     king: v.ValidatorSubmission | None,
+    archive_reason: str = "rotation",
 ) -> dict[str, Any]:
     task_root = Path(task.task_root)
     artifacts = task_artifact_records(task_root)
@@ -328,6 +332,7 @@ def task_archive_jsonl_row(
         "archived_at": v._timestamp(),
         "archive_hour": archive_hour_value,
         "pool_label": pool_label,
+        "archive_reason": archive_reason,
         "task_name": task.task_name,
         "task_root_name": task_root.name,
         "pool_task": task.to_dict(),
@@ -394,7 +399,8 @@ def archive_pool_task_to_hf_jsonl(
     pool_label: str,
     king: v.ValidatorSubmission | None,
     leased_task_names: set[str],
-    upload_jsonl: Any = append_hf_dataset_jsonl,
+    upload_jsonl: Any | None = None,
+    archive_reason: str = "rotation",
 ) -> None:
     if not _task_archive_enabled(config):
         return
@@ -403,6 +409,7 @@ def archive_pool_task_to_hf_jsonl(
     dataset_id = config.validate_task_archive_hf_dataset
     if not token or not dataset_id:
         return
+    upload_jsonl = upload_jsonl or append_hf_dataset_jsonl
     with _TASK_ARCHIVE_UPLOAD_LOCK:
         existing = (load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks") or {}).get(task.task_name)
         if archive_entry_upload_is_complete(existing):
@@ -417,9 +424,16 @@ def archive_pool_task_to_hf_jsonl(
             status="pool_inserted",
             archive_hour_value=hour,
             hf_path=hf_path,
+            archive_reason=archive_reason,
         )
         try:
-            row = task_archive_jsonl_row(task=task, pool_label=pool_label, archive_hour_value=hour, king=king)
+            row = task_archive_jsonl_row(
+                task=task,
+                pool_label=pool_label,
+                archive_hour_value=hour,
+                king=king,
+                archive_reason=archive_reason,
+            )
             upload_result = upload_jsonl(dataset_id=dataset_id, token=token, path_in_repo=hf_path, row=row)
         except Exception as exc:
             record_task_archive_status(
@@ -430,6 +444,7 @@ def archive_pool_task_to_hf_jsonl(
                 archive_hour_value=hour,
                 hf_path=hf_path,
                 error=str(exc),
+                archive_reason=archive_reason,
             )
             log.exception("Task archive[%s]: HF upload failed for %s", pool_label, task.task_name)
             return
@@ -443,6 +458,7 @@ def archive_pool_task_to_hf_jsonl(
             status="uploaded_delete_pending",
             archive_hour_value=hour,
             hf_path=hf_path,
+            archive_reason=archive_reason,
         )
         lease_note = "; active lease snapshot existed" if task.task_name in leased_task_names else ""
         log.info(
@@ -496,6 +512,15 @@ def pool_task_by_name(pool: v.TaskPool, task_name: str) -> v.PoolTask | None:
     return next((task for task in pool.list_tasks() if task.task_name == task_name), None)
 
 
+def pool_for_archive_label(pools_by_label: dict[str, v.TaskPool], pool_label: str) -> v.TaskPool | None:
+    pool = pools_by_label.get(pool_label)
+    if pool is not None:
+        return pool
+    if pool_label.startswith("king-transition-"):
+        return pools_by_label.get(pool_label.removeprefix("king-transition-"))
+    return None
+
+
 def retry_failed_task_uploads(
     *,
     config: RunConfig,
@@ -517,7 +542,7 @@ def retry_failed_task_uploads(
         latest = load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks", {}).get(task_name, {})
         if archive_entry_upload_is_complete(latest):
             pool_label = str(latest.get("pool_label") or entry.get("pool_label") or "") if isinstance(latest, dict) else ""
-            pool = pools_by_label.get(pool_label)
+            pool = pool_for_archive_label(pools_by_label, pool_label)
             if pool is not None:
                 pool.remove(task_name)
             continue
@@ -528,7 +553,12 @@ def retry_failed_task_uploads(
             or entry.get("pool_label")
             or ""
         )
-        pool = pools_by_label.get(pool_label)
+        archive_reason = str(
+            (latest.get("archive_reason") if isinstance(latest, dict) else None)
+            or entry.get("archive_reason")
+            or "rotation"
+        )
+        pool = pool_for_archive_label(pools_by_label, pool_label)
         if pool is None:
             record_task_archive_status(
                 config=config,
@@ -560,6 +590,7 @@ def retry_failed_task_uploads(
             king=king,
             leased_task_names=leased_names,
             upload_jsonl=upload_jsonl,
+            archive_reason=archive_reason,
         )
         latest = load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks", {}).get(task_name, {})
         if isinstance(latest, dict) and latest.get("status") != "upload_failed":

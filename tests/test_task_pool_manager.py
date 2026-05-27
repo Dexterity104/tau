@@ -111,7 +111,7 @@ class TaskPoolManagerTest(unittest.TestCase):
             self.assertEqual(manager.archive_quota_remaining(config, pool_label="retest", hour="2026-05-22-01"), 0)
             self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-02"), 2)
 
-    def test_archive_quota_reservation_consumes_generation_attempt(self):
+    def test_archive_quota_reservation_blocks_concurrent_attempts_until_released(self):
         with tempfile.TemporaryDirectory() as td:
             config = RunConfig(workspace_root=Path(td), validate_task_archive_per_hour=1)
 
@@ -135,7 +135,15 @@ class TaskPoolManagerTest(unittest.TestCase):
 
             manager.release_archive_reservation(config=config, task_name="validate-20260101000000-000001")
 
-            self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-01"), 0)
+            self.assertEqual(manager.archive_quota_remaining(config, pool_label="primary", hour="2026-05-22-01"), 1)
+            self.assertIsNotNone(
+                manager.reserve_archive_quota(
+                    config=config,
+                    task_name="validate-20260101000000-000002",
+                    pool_label="primary",
+                    hour="2026-05-22-01",
+                )
+            )
             ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
             self.assertEqual(ledger["tasks"]["validate-20260101000000-000001"]["status"], "archive_generation_skipped")
 
@@ -628,6 +636,47 @@ class TaskPoolManagerTest(unittest.TestCase):
             self.assertEqual(uploaded[0]["path_in_repo"], "tasks/primary/2026-05-22-01.jsonl")
             ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
             self.assertEqual(ledger["tasks"][task.task_name]["status"], "uploaded_delete_pending")
+
+    def test_retry_king_transition_upload_preserves_archive_reason(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_task_archive_enabled=True,
+                validate_task_archive_hf_dataset="owner/dataset",
+                validate_task_archive_per_hour=1,
+            )
+            pool = TaskPool(Path(td) / "pool")
+            task = self._task(config)
+            pool.add(task)
+            manager.record_task_archive_status(
+                config=config,
+                task_name=task.task_name,
+                pool_label="king-transition-primary",
+                status="upload_failed",
+                archive_hour_value="2026-05-22-01",
+                hf_path="tasks/king-transition-primary/2026-05-22-01.jsonl",
+                error="hf down",
+                archive_reason="king_transition",
+            )
+            uploaded = []
+
+            with patch.dict("os.environ", {"HF_TOKEN": "token"}):
+                retried = manager.retry_failed_task_uploads(
+                    config=config,
+                    pools_by_label={"primary": pool},
+                    king=None,
+                    upload_jsonl=lambda **kwargs: uploaded.append(kwargs) or "ok",
+                )
+
+            self.assertEqual(retried, 1)
+            self.assertEqual(pool.size(), 0)
+            self.assertEqual(uploaded[0]["row"]["archive_reason"], "king_transition")
+            self.assertEqual(uploaded[0]["path_in_repo"], "tasks/king-transition-primary/2026-05-22-01.jsonl")
+            ledger = manager.load_task_archive_ledger(manager.task_archive_ledger_path(config))
+            entry = ledger["tasks"][task.task_name]
+            self.assertEqual(entry["status"], "uploaded_delete_pending")
+            self.assertEqual(entry["archive_reason"], "king_transition")
+            self.assertEqual(manager.archive_quota_remaining(config, hour="2026-05-22-01"), 1)
 
     def test_retry_upload_does_not_fail_task_completed_by_other_worker(self):
         with tempfile.TemporaryDirectory() as td:

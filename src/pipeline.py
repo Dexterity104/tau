@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import random
 import sys
@@ -186,6 +187,8 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
     solution_paths.solution_diff_path.write_text(solve_result.solution_diff + "\n")
     if solve_result.rollout_output:
         solution_paths.rollout_jsonl_path.write_text(solve_result.rollout_output.rstrip("\n") + "\n")
+    agent_source = config.solver_agent_source
+    agent_file_sha256 = _solver_agent_file_sha256(agent_source)
     write_json(
         solution_paths.solve_json_path,
         {
@@ -195,7 +198,13 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             "repo_full_name": candidate.repo_full_name,
             "commit_sha": candidate.commit_sha,
             "agent": _solve_agent_label(config),
-            "agent_source": config.solver_agent_source.to_dict() if config.solver_agent_source else None,
+            "agent_source": agent_source.to_dict() if agent_source else None,
+            "agent_file_sha256": agent_file_sha256,
+            "agent_file_sha256_matches_commit": (
+                agent_file_sha256.lower() == agent_source.commit_sha.lower()
+                if agent_file_sha256 and agent_source and agent_source.commit_sha
+                else None
+            ),
             "solver_backend": config.solver_backend,
             "agent_timeout_seconds": config.agent_timeout,
             "result": solve_result.to_dict(),
@@ -212,6 +221,25 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
         exit_reason=solve_result.exit_reason,
         elapsed_seconds=solve_result.elapsed_seconds,
     )
+
+
+def _solver_agent_file_path(agent_source) -> Path | None:
+    if agent_source is None or agent_source.kind not in {"local_file", "local_path"}:
+        return None
+    local_path = agent_source.local_path
+    if not local_path:
+        return None
+    path = Path(local_path)
+    if path.is_dir():
+        return path / (agent_source.agent_file or "agent.py")
+    return path
+
+
+def _solver_agent_file_sha256(agent_source) -> str | None:
+    path = _solver_agent_file_path(agent_source)
+    if path is None or not path.is_file():
+        return None
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 @dataclass(slots=True)

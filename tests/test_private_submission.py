@@ -27,6 +27,7 @@ from private_submission import (
 from validate import (
     ValidatorSubmission,
     ValidatorState,
+    _agent_cache_entry_valid,
     _build_agent_config,
     _fetch_chain_submissions,
     _fetch_private_api_submissions,
@@ -34,6 +35,7 @@ from validate import (
     _reconcile_state_with_duel_history,
     _refresh_queue,
     _submission_is_eligible,
+    _write_agent_cache_metadata,
 )
 
 
@@ -384,6 +386,37 @@ class PrivateSubmissionChecksTest(unittest.TestCase):
 
 
 class PrivateSubmissionValidatorTest(unittest.TestCase):
+    def test_public_agent_cache_requires_matching_metadata_and_file_hash(self):
+        submission = ValidatorSubmission(
+            hotkey=HOTKEY,
+            uid=7,
+            repo_full_name="miner/ninja",
+            repo_url="https://github.com/miner/ninja.git",
+            commit_sha="a" * 40,
+            commitment="miner/ninja@" + "a" * 40,
+            commitment_block=100,
+            source="chain",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp)
+            agent_path = cache_dir / "agent.py"
+            agent_path.write_text(GOOD_AGENT, encoding="utf-8")
+
+            self.assertFalse(
+                _agent_cache_entry_valid(cache_dir=cache_dir, agent_path=agent_path, sub=submission)
+            )
+
+            _write_agent_cache_metadata(cache_dir=cache_dir, agent_path=agent_path, sub=submission)
+            self.assertTrue(
+                _agent_cache_entry_valid(cache_dir=cache_dir, agent_path=agent_path, sub=submission)
+            )
+
+            agent_path.write_text(GOOD_AGENT + "\n# changed\n", encoding="utf-8")
+            self.assertFalse(
+                _agent_cache_entry_valid(cache_dir=cache_dir, agent_path=agent_path, sub=submission)
+            )
+
     def test_fetch_private_api_submissions_accepts_checked_private_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

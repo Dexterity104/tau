@@ -2377,6 +2377,28 @@ def _remove_compare_artifacts(*, task_name: str, solution_names: list[str], conf
     shutil.rmtree(compare_paths.root, ignore_errors=True)
 
 
+def _pending_king_transition_archive_names(config: RunConfig) -> set[str]:
+    try:
+        import task_pool_manager as pool_manager
+    except Exception:
+        log.exception("Pool cache prune: could not inspect task archive ledger")
+        return set()
+
+    tasks = pool_manager.load_task_archive_ledger(
+        pool_manager.task_archive_ledger_path(config)
+    ).get("tasks") or {}
+    pending_statuses = {"pool_inserted", "upload_failed", "uploaded_delete_pending"}
+    return {
+        str(task_name)
+        for task_name, entry in tasks.items()
+        if (
+            isinstance(entry, dict)
+            and entry.get("archive_reason") == "king_transition"
+            and entry.get("status") in pending_statuses
+        )
+    }
+
+
 def _prune_king_cache_to_current_pools(
     *,
     config: RunConfig,
@@ -2394,7 +2416,8 @@ def _prune_king_cache_to_current_pools(
             "dropped_retest_pool_tasks": 0,
         }
 
-    healthy_keep_names: set[str] = set()
+    archived_keep_names = _pending_king_transition_archive_names(config)
+    healthy_keep_names: set[str] = set(archived_keep_names)
     dropped_primary_pool_tasks = 0
     dropped_retest_pool_tasks = 0
 
@@ -2406,6 +2429,8 @@ def _prune_king_cache_to_current_pools(
     ) -> int:
         dropped = 0
         for task in current_pool.list_tasks():
+            if task.task_name in archived_keep_names:
+                continue
             if not _pool_task_matches_king(task, king):
                 current_pool.remove(task.task_name)
                 dropped += 1
@@ -2468,6 +2493,44 @@ def _pool_task_matches_king(task: PoolTask, king: ValidatorSubmission) -> bool:
     return task.king_hotkey == king.hotkey and task.king_commit_sha == king.commit_sha
 
 
+def _archive_stale_pool_tasks_for_king_transition(
+    *,
+    config: RunConfig,
+    pool: TaskPool,
+    stale_tasks: Sequence[PoolTask],
+    pool_label: str,
+    stale_king: ValidatorSubmission | None,
+) -> int:
+    if not stale_tasks:
+        return 0
+    try:
+        import task_pool_manager as pool_manager
+    except Exception:
+        log.exception("Pool static[%s]: could not import task archive manager", pool_label)
+        return 0
+
+    archived = 0
+    leased_task_names = _active_duel_task_names(_load_state(config.validate_root / "state.json"))
+    archive_label = f"king-transition-{pool_label}"
+    for task in stale_tasks:
+        pool_manager.archive_pool_task_to_hf_jsonl(
+            config=config,
+            pool=pool,
+            task=task,
+            pool_label=archive_label,
+            king=stale_king,
+            leased_task_names=leased_task_names,
+            archive_reason="king_transition",
+        )
+        ledger = pool_manager.load_task_archive_ledger(
+            pool_manager.task_archive_ledger_path(config)
+        )
+        entry = (ledger.get("tasks") or {}).get(task.task_name)
+        if pool_manager.archive_entry_upload_is_complete(entry):
+            archived += 1
+    return archived
+
+
 def _flush_static_pool_if_stale_for_king(
     *,
     config: RunConfig,
@@ -2475,6 +2538,8 @@ def _flush_static_pool_if_stale_for_king(
     king: ValidatorSubmission | None,
     pool_label: str,
     pool_starved: threading.Event | None = None,
+    archive_stale: bool = False,
+    stale_king: ValidatorSubmission | None = None,
 ) -> int:
     if not config.validate_task_pool_static or king is None:
         return 0
@@ -2482,14 +2547,30 @@ def _flush_static_pool_if_stale_for_king(
     stale = [task for task in tasks if not _pool_task_matches_king(task, king)]
     if not stale:
         return 0
-    removed = pool.flush()
+    archived = (
+        _archive_stale_pool_tasks_for_king_transition(
+            config=config,
+            pool=pool,
+            stale_tasks=stale,
+            pool_label=pool_label,
+            stale_king=stale_king,
+        )
+        if archive_stale
+        else 0
+    )
+    if archive_stale:
+        removed = archived
+    else:
+        removed = pool.flush()
     if pool_starved is not None:
         pool_starved.set()
     log.warning(
-        "Pool static[%s]: flushed %d cached task(s) because %d belonged to a prior king; current king is %s",
+        "Pool static[%s]: stale cached task(s) for prior king=%d; archived=%d; "
+        "flushed_without_archive=%d; current king is %s",
         pool_label,
-        removed,
         len(stale),
+        archived,
+        0 if archive_stale else removed,
         king.agent_ref,
     )
     return removed
@@ -4554,6 +4635,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     king=replacement,
                                     pool_label="primary",
                                     pool_starved=pool_starved,
+                                    archive_stale=True,
+                                    stale_king=old_king,
                                 )
                                 _flush_static_pool_if_stale_for_king(
                                     config=config,
@@ -4561,6 +4644,8 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                     king=replacement,
                                     pool_label="retest",
                                     pool_starved=retest_pool_starved,
+                                    archive_stale=True,
+                                    stale_king=old_king,
                                 )
                                 purge_counts = _prune_king_cache_to_current_pools(
                                     config=config,
@@ -6806,11 +6891,11 @@ def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> Pat
     cache_key = _agent_cache_key(sub)
     cache_dir = cache_root / cache_key
     agent_path = cache_dir / _DEFAULT_GITHUB_AGENT_FILE
-    if agent_path.is_file():
+    if _agent_cache_entry_valid(cache_dir=cache_dir, agent_path=agent_path, sub=sub):
         return agent_path
 
     with _AGENT_CACHE_LOCK:
-        if agent_path.is_file():
+        if _agent_cache_entry_valid(cache_dir=cache_dir, agent_path=agent_path, sub=sub):
             return agent_path
 
         tmp_dir = cache_root / f".{cache_key}.tmp-{os.getpid()}-{time.time_ns()}"
@@ -6835,6 +6920,7 @@ def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> Pat
             staged_agent.write_text(show.stdout, encoding="utf-8")
             if not staged_agent.read_text(encoding="utf-8").strip():
                 raise RuntimeError("cached agent.py is empty")
+            _write_agent_cache_metadata(cache_dir=tmp_dir, agent_path=staged_agent, sub=sub)
 
             shutil.rmtree(cache_dir, ignore_errors=True)
             tmp_dir.rename(cache_dir)
@@ -6850,6 +6936,56 @@ def _agent_cache_key(sub: ValidatorSubmission) -> str:
         f"{sub.repo_url}\0{sub.commit_sha}\0{_DEFAULT_GITHUB_AGENT_FILE}".encode("utf-8"),
     ).hexdigest()[:16]
     return f"{repo}--{sub.commit_sha[:12]}--{digest}"
+
+
+def _agent_cache_metadata_path(cache_dir: Path) -> Path:
+    return cache_dir / "cache.json"
+
+
+def _agent_file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _expected_agent_cache_metadata(sub: ValidatorSubmission, agent_sha256: str) -> dict[str, str]:
+    return {
+        "repo_url": sub.repo_url,
+        "repo_full_name": sub.repo_full_name,
+        "commit_sha": sub.commit_sha,
+        "agent_file": _DEFAULT_GITHUB_AGENT_FILE,
+        "agent_sha256": agent_sha256,
+    }
+
+
+def _write_agent_cache_metadata(
+    *,
+    cache_dir: Path,
+    agent_path: Path,
+    sub: ValidatorSubmission,
+) -> None:
+    write_json(
+        _agent_cache_metadata_path(cache_dir),
+        _expected_agent_cache_metadata(sub, _agent_file_sha256(agent_path)),
+    )
+
+
+def _agent_cache_entry_valid(
+    *,
+    cache_dir: Path,
+    agent_path: Path,
+    sub: ValidatorSubmission,
+) -> bool:
+    if not agent_path.is_file():
+        return False
+    metadata_path = _agent_cache_metadata_path(cache_dir)
+    if not metadata_path.is_file():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        actual_sha = _agent_file_sha256(agent_path)
+    except (OSError, ValueError):
+        return False
+    expected = _expected_agent_cache_metadata(sub, actual_sha)
+    return all(str(metadata.get(key) or "") == value for key, value in expected.items())
 
 
 def _resolve_fetchable_commit(*, repo_dir: Path, requested: str) -> str:
