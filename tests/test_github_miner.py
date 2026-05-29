@@ -3,7 +3,7 @@ import unittest
 
 import httpx
 
-from github_miner import GitHubMiner, GitHubTokenRotator
+from github_miner import GitHubMiner, GitHubTokenRotator, clear_recent_events_cache
 
 
 class FakeGitHubClient:
@@ -19,6 +19,9 @@ class FakeGitHubClient:
 
 
 class GitHubTokenRotatorTest(unittest.TestCase):
+    def tearDown(self):
+        clear_recent_events_cache()
+
     def test_401_disables_token_and_retries_next_token(self):
         rotator = GitHubTokenRotator(["bad-token", "good-token"])
         miner = GitHubMiner(token_rotator=rotator, rng=random.Random(1))
@@ -54,6 +57,55 @@ class GitHubTokenRotatorTest(unittest.TestCase):
                 {},
             ],
         )
+
+    def test_sample_commit_reuses_events_across_attempts(self):
+        miner = GitHubMiner(rng=random.Random(1))
+        events = [
+            {
+                "type": "PushEvent",
+                "id": "event-1",
+                "repo": {"name": "owner/repo"},
+                "payload": {"commits": [{"sha": "bad-sha"}]},
+            }
+        ]
+        calls = {"events": 0, "commit": 0}
+
+        def fake_recent_events():
+            calls["events"] += 1
+            return events
+
+        def fake_fetch_commit_candidate(**_kwargs):
+            calls["commit"] += 1
+            raise ValueError("bad commit")
+
+        miner._recent_push_events = fake_recent_events
+        miner._fetch_commit_candidate = fake_fetch_commit_candidate
+
+        with self.assertRaisesRegex(RuntimeError, "bad commit"):
+            miner.sample_commit(max_attempts=3)
+
+        self.assertEqual(calls, {"events": 1, "commit": 3})
+
+    def test_recent_push_events_cache_is_shared_between_miners(self):
+        event_payload = [
+            {
+                "type": "PushEvent",
+                "id": "event-1",
+                "repo": {"name": "owner/repo"},
+                "payload": {"commits": [{"sha": "abc"}]},
+            }
+        ]
+        response = httpx.Response(200, json=event_payload)
+        response.headers["link"] = ""
+        miner_a = GitHubMiner(rng=random.Random(1))
+        miner_b = GitHubMiner(rng=random.Random(2))
+        miner_a._client = FakeGitHubClient([response])
+        miner_b._client = FakeGitHubClient([])
+
+        self.assertEqual(miner_a._recent_push_events(), event_payload)
+        self.assertEqual(miner_b._recent_push_events(), event_payload)
+        self.assertEqual(len(miner_a._client.headers_seen), 1)
+        self.assertEqual(len(miner_b._client.headers_seen), 0)
 
 
 if __name__ == "__main__":

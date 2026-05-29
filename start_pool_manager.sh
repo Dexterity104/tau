@@ -20,5 +20,5 @@ exec /home/const/subnet66/.venv/bin/python -m cli pool-manager \
   --rollout-root /home/const/subnet66/tau/workspace/rollouts \
   --push-rollouts-to-hf \
   --rollout-hf-dataset "$TAU_ROLLOUT_HF_DATASET" \
-  --pool-filler-concurrency 10
+  --pool-filler-concurrency 25
 '

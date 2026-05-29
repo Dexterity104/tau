@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from datetime import UTC, datetime
@@ -9,6 +10,8 @@ from typing import Any
 
 from tau.rollouts.redaction import public_rollout
 from tau.rollouts.store import load_task_rollouts, write_gzip_jsonl
+
+log = logging.getLogger("swe-eval.rollouts.export-hf")
 
 
 def export_hour(dt: datetime | None = None) -> str:
@@ -159,16 +162,22 @@ def export_retired_rollouts_to_hf(
     root = getattr(config, "resolved_rollout_root")()
     manifest = load_export_manifest(root)
     count = 0
-    for task_name in sorted(local_rollout_task_names(root) - set(active_task_names)):
+    pending_task_names = sorted(local_rollout_task_names(root) - set(active_task_names))
+    for task_name in pending_task_names:
         if exported_task_hf_path(manifest, task_name):
             continue
-        path_in_repo = export_task_rollouts_to_hf(
-            config=config,
-            task_name=task_name,
-            upload_file=upload_file,
-        )
+        try:
+            path_in_repo = export_task_rollouts_to_hf(
+                config=config,
+                task_name=task_name,
+                upload_file=upload_file,
+            )
+        except Exception:
+            log.exception("Rollout export failed for %s; continuing with remaining tasks", task_name)
+            continue
         if not path_in_repo:
             continue
+        log.info("Exported rollout task bundle %s to %s", task_name, path_in_repo)
         count += 1
         manifest = load_export_manifest(root)
     return count

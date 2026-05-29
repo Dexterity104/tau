@@ -167,6 +167,45 @@ class RolloutHelpersTest(unittest.TestCase):
             self.assertEqual(len(uploads), 1)
             self.assertTrue(uploads[0].endswith("/retired-task.jsonl.gz"))
 
+    def test_retired_export_continues_after_task_upload_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "rollouts"
+            for task_name in ("task-a", "task-b"):
+                append_rollout(root, {
+                    "schema_version": 1,
+                    "rollout_id": f"rol_{task_name}",
+                    "task_name": task_name,
+                    "trajectory": [],
+                    "issue": task_name,
+                })
+
+            uploads = []
+
+            def fake_upload(**kwargs):
+                if kwargs["task_name"] == "task-a":
+                    raise RuntimeError("boom")
+                uploads.append(kwargs["path_in_repo"])
+
+            config = SimpleNamespace(
+                push_rollouts_to_hf=True,
+                rollout_hf_dataset="owner/dataset",
+                rollout_hf_token_env="HF_TOKEN",
+                resolved_rollout_root=lambda: root,
+            )
+            with patch.dict(os.environ, {"HF_TOKEN": "token"}):
+                count = export_retired_rollouts_to_hf(
+                    config=config,
+                    active_task_names=set(),
+                    upload_file=fake_upload,
+                )
+
+            self.assertEqual(count, 1)
+            self.assertEqual(len(uploads), 1)
+            self.assertTrue(uploads[0].endswith("/task-b.jsonl.gz"))
+            manifest_tasks = load_export_manifest(root)["tasks"]
+            self.assertNotIn("task-a", manifest_tasks)
+            self.assertIn("task-b", manifest_tasks)
+
     def test_trajectory_events_are_time_ordered_before_ids(self):
         record = build_rollout_record(
             rollout_id_value="rol_order",

@@ -1039,6 +1039,17 @@ def _hydrate_queue_submission_metadata(
     ]
 
 
+def _submission_is_current_for_registration(
+    submission: ValidatorSubmission,
+    registration_block: int | None,
+) -> bool:
+    return _submission_counts_for_spent(
+        submission,
+        min_commitment_block=None,
+        registration_block=registration_block,
+    )
+
+
 def _pop_resumable_active_challenger(
     state: ValidatorState,
     *,
@@ -5053,7 +5064,19 @@ def _publish_dashboard(
         "chain_data": chain_data,
     }
 
-    payload = {"updated_at": _timestamp(), "current_king": king_dict, "duels": history, "status": status}
+    previous_dashboard = {}
+    try:
+        previous_dashboard = read_json(config.validate_root / "dashboard_data.json")
+    except Exception:
+        previous_dashboard = {}
+    benchmarks = previous_dashboard.get("benchmarks") if isinstance(previous_dashboard.get("benchmarks"), dict) else {}
+    payload = {
+        "updated_at": _timestamp(),
+        "current_king": king_dict,
+        "duels": history,
+        "status": status,
+        "benchmarks": benchmarks,
+    }
     try:
         write_json(config.validate_root / "dashboard_data.json", payload)
         write_json(config.validate_root / "dashboard-home.json", build_dashboard_home_payload(payload))
@@ -6243,6 +6266,21 @@ def _refresh_queue(
                 registration_block=registration_block_cache[submission.hotkey],
             )
         return registration_block_cache[submission.hotkey]
+
+    original_queue_size = len(state.queue)
+    state.queue = [
+        submission
+        for submission in state.queue
+        if _submission_is_current_for_registration(
+            submission,
+            registration_block_for(submission),
+        )
+    ]
+    if len(state.queue) != original_queue_size:
+        log.info(
+            "Removed %d stale queued submission(s) that predate current registration",
+            original_queue_size - len(state.queue),
+        )
 
     known_agents: set[str] = set()
     if state.current_king and state.current_king.agent_ref:

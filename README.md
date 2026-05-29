@@ -11,6 +11,72 @@
 7. `serve-submissions-api` accepts private miner submissions over HTTP.
 8. `validate` runs the live king-of-the-hill validator loop.
 9. `restore-r2-kings` republishes the validator dashboard's recent king window.
+10. `benchmarks` plans or runs external benchmark harnesses for SWE-rebench,
+    DeepSWE, and Terminal-Bench.
+11. `swebench-king-benchmark` watches crowned kings and runs SWE-bench Verified
+    against the pi baseline.
+
+## External Benchmarks
+
+Use `tau benchmarks` to keep a repeatable run plan for the three external
+agent evals we care about after a challenger becomes king:
+
+```bash
+tau benchmarks --agent king --model openai/gpt-5.2 --n-tasks 25 --sample-seed 66
+```
+
+By default this writes `workspace/benchmarks/benchmark-plan.json` without
+executing external tools. Add `--run` once the harness CLIs are installed and
+their agent selectors are wired:
+
+```bash
+tau benchmarks --agent king --model openai/gpt-5.2 --n-tasks 25 --sample-seed 66 --run
+```
+
+The configured suite is:
+
+- SWE-rebench, via the `nebius/SWE-rebench-leaderboard` dataset
+- DeepSWE, via the `datacurve-ai/deep-swe` task suite
+- Terminal-Bench, via `terminal-bench-core==head`
+
+For a sub-five-minute external smoke, use Runloop's public SWE-bench Verified
+and Terminal-Bench jobs with both agents planned side by side:
+
+```bash
+tau benchmarks \
+  --provider runloop \
+  --preset smoke \
+  --agent king \
+  --baseline pi \
+  --scenario <swe-or-terminal-scenario-id>
+```
+
+This writes a plan for `swe-bench-verified` and `terminal-bench-2` using
+Runloop's supported multi-agent job form. Pass explicit scenario ids for
+sub-five-minute smoke runs; otherwise Runloop runs the full benchmark. Add
+`--run` after `rli` is installed and `RUNLOOP_API_KEY` is configured.
+
+## Crown SWE-Bench Benchmark
+
+Run the crowned-king SWE-bench daemon under PM2 with:
+
+```bash
+pm2 start ./start_swebench_king_benchmark.sh --name swebench-king-benchmark
+```
+
+The daemon watches `workspace/validate/netuid-66/state.json`. When
+`current_king.commit_sha` changes, it runs the fixed
+`data/swebench_verified_sample_50_seed66.json` sample for both the crowned king
+and `https://github.com/earendil-works/pi`, using `minimax/minimax-m2.7` and
+provider `minimax/fp8`. It writes predictions, solve results, proxy usage,
+official SWE-bench scoring output, and `comparison.json` under:
+
+```text
+workspace/validate/netuid-66/benchmarks/swebench-verified/<king_commit>/
+```
+
+The daemon also merges a compact summary into local dashboard JSON and R2 under
+`benchmarks.swebench_verified`.
 
 ## Miner Harness
 

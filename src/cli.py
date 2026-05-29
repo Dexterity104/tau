@@ -354,6 +354,50 @@ def build_parser() -> argparse.ArgumentParser:
     delete_group.add_argument("--task", help="Delete one saved task by name.")
     delete_group.add_argument("--all", action="store_true", help="Delete all saved task workspaces.")
 
+    benchmarks = subparsers.add_parser(
+        "benchmarks",
+        help="Plan or run external agent benchmarks: SWE-rebench, DeepSWE, and Terminal-Bench.",
+    )
+    _add_shared_args(benchmarks)
+    benchmarks.add_argument(
+        "--benchmark",
+        action="append",
+        choices=["rebench", "deepswe", "terminal-bench", "swe-bench-verified"],
+        help="Benchmark to include. Repeat to select multiple; defaults depend on --provider.",
+    )
+    benchmarks.add_argument(
+        "--provider",
+        choices=["local", "runloop"],
+        default="local",
+        help="Benchmark execution provider. Use runloop for fast public benchmark jobs.",
+    )
+    benchmarks.add_argument("--preset", choices=["smoke", "mini", "nightly"], help="Task-count preset.")
+    benchmarks.add_argument("--agent", help="Agent selector to pass through to each benchmark harness.")
+    benchmarks.add_argument("--baseline", help="Optional baseline agent selector for side-by-side Runloop plans.")
+    benchmarks.add_argument("--model", help="Model selector to append to each benchmark command.")
+    benchmarks.add_argument("--n-tasks", type=int, help="Optional task cap for smoke/continuous runs.")
+    benchmarks.add_argument(
+        "--scenario",
+        action="append",
+        help="Runloop scenario ID to run. Repeat for multiple scenarios; required for sub-five-minute smoke jobs.",
+    )
+    benchmarks.add_argument("--sample-seed", type=int, help="Optional sample seed for deterministic subsets.")
+    benchmarks.add_argument(
+        "--output-root",
+        type=Path,
+        help="Directory for benchmark reports and per-benchmark artifacts.",
+    )
+    benchmarks.add_argument(
+        "--run",
+        action="store_true",
+        help="Execute the benchmark commands. Without this flag, only write the run plan.",
+    )
+    benchmarks.add_argument(
+        "--list",
+        action="store_true",
+        help="Print the configured benchmark metadata instead of planning a run.",
+    )
+
     private_submit = subparsers.add_parser(
         "private-submit",
         help="Validate and store a signed private miner agent.py submission bundle.",
@@ -512,6 +556,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose debug logging for the one-shot restore.",
     )
+
+    swebench_king = subparsers.add_parser(
+        "swebench-king-benchmark",
+        help="Run a daemon that benchmarks each newly crowned king against the pi SWE-bench baseline.",
+    )
+    swebench_king.add_argument("--validate-root", type=Path, default=Path("workspace/validate/netuid-66"))
+    swebench_king.add_argument("--state-path", type=Path)
+    swebench_king.add_argument("--manifest", type=Path, default=Path("data/swebench_verified_sample_50_seed66.json"))
+    swebench_king.add_argument("--pi-repo", default="https://github.com/earendil-works/pi")
+    swebench_king.add_argument("--pi-ref", default="main")
+    swebench_king.add_argument("--model", default="minimax/minimax-m2.7")
+    swebench_king.add_argument("--provider-only", default="minimax/fp8")
+    swebench_king.add_argument("--workers", type=int, default=20)
+    swebench_king.add_argument("--poll-interval-seconds", type=int, default=60)
+    swebench_king.add_argument("--once", action="store_true")
+    swebench_king.add_argument("--skip-scoring", action="store_true")
+    swebench_king.add_argument("--debug", action="store_true")
     return parser
 
 
@@ -575,6 +636,9 @@ def main() -> None:
             else:
                 print(f"deleted task {result.deleted_tasks[0]}")
             return
+        if args.command == "benchmarks":
+            _run_benchmarks(args)
+            return
         if args.command == "private-submit":
             _run_private_submit(args)
             return
@@ -609,6 +673,35 @@ def main() -> None:
                 f"current_king_uid={result['current_king_uid']}"
             )
             print(result["validate_root"])
+            return
+        if args.command == "swebench-king-benchmark":
+            import swebench_crown_benchmark
+
+            benchmark_args = [
+                "--validate-root",
+                str(args.validate_root),
+                "--manifest",
+                str(args.manifest),
+                "--pi-repo",
+                args.pi_repo,
+                "--pi-ref",
+                args.pi_ref,
+                "--model",
+                args.model,
+                "--provider-only",
+                args.provider_only,
+                "--workers",
+                str(args.workers),
+                "--poll-interval-seconds",
+                str(args.poll_interval_seconds),
+            ]
+            if args.state_path:
+                benchmark_args.extend(["--state-path", str(args.state_path)])
+            if args.once:
+                benchmark_args.append("--once")
+            if args.skip_scoring:
+                benchmark_args.append("--skip-scoring")
+            swebench_crown_benchmark.main(benchmark_args)
             return
         parser.error(f"Unknown command: {args.command}")
     except Exception as exc:  # noqa: BLE001
@@ -731,6 +824,64 @@ def _build_delete_config(args: argparse.Namespace) -> RunConfig:
         agent_timeout=args.agent_timeout,
         debug=args.debug,
     )
+
+
+def _run_benchmarks(args: argparse.Namespace) -> None:
+    from benchmarks import (
+        BENCHMARK_SPECS,
+        benchmark_runs,
+        runloop_concurrency_for_preset,
+        runloop_benchmark_runs,
+        runloop_specs_as_dicts,
+        runloop_timeout_for_preset,
+        run_benchmark_plan,
+        specs_as_dicts,
+        task_count_for_preset,
+        write_benchmark_report,
+    )
+
+    if args.list:
+        specs = runloop_specs_as_dicts() if args.provider == "runloop" else specs_as_dicts(BENCHMARK_SPECS)
+        print(json.dumps(specs, indent=2, sort_keys=True))
+        return
+
+    output_root = (
+        args.output_root.expanduser()
+        if args.output_root is not None
+        else args.workspace_root / "benchmarks"
+    ).resolve()
+    report_path = output_root / "benchmark-plan.json"
+    n_tasks = task_count_for_preset(preset=args.preset, n_tasks=args.n_tasks)
+    if args.provider == "runloop":
+        if not args.agent:
+            raise ValueError("--agent is required for --provider runloop")
+        if args.preset == "smoke" and not args.scenario:
+            raise ValueError(
+                "--provider runloop --preset smoke requires at least one --scenario id; "
+                "otherwise Runloop will run the full benchmark."
+            )
+        runs = runloop_benchmark_runs(
+            names=args.benchmark,
+            agent=args.agent,
+            baseline=args.baseline,
+            scenario_ids=tuple(args.scenario or ()),
+            timeout=runloop_timeout_for_preset(args.preset),
+            n_concurrent_trials=runloop_concurrency_for_preset(args.preset),
+            output_root=output_root,
+        )
+    else:
+        runs = benchmark_runs(
+            names=args.benchmark,
+            agent=args.agent,
+            model=args.model,
+            n_tasks=n_tasks,
+            sample_seed=args.sample_seed,
+            output_root=output_root,
+        )
+    report = run_benchmark_plan(runs, dry_run=not args.run)
+    write_benchmark_report(report_path, report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    print(report_path)
 
 
 def _run_private_submit(args: argparse.Namespace) -> None:

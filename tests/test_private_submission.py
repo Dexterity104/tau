@@ -862,6 +862,45 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
         self.assertEqual([item.hotkey for item in state.queue], [older.hotkey, newer.hotkey])
         self.assertEqual([item.accepted_at for item in state.queue], [older.accepted_at, newer.accepted_at])
 
+    def test_refresh_queue_removes_private_submission_from_prior_registration(self):
+        stale = ValidatorSubmission(
+            hotkey=HOTKEY,
+            uid=42,
+            repo_full_name="private-submission/stale",
+            repo_url="private-submission://stale",
+            commit_sha="a" * 64,
+            commitment=f"private-submission:stale:{'a' * 64}",
+            commitment_block=100,
+            source="private",
+            accepted_at="2026-05-24T21:51:16.885693+00:00",
+        )
+        current = ValidatorSubmission(
+            hotkey="5CurrentPrivateSubmissionHotkey",
+            uid=24,
+            repo_full_name="private-submission/current",
+            repo_url="private-submission://current",
+            commit_sha="b" * 64,
+            commitment=f"private-submission:current:{'b' * 64}",
+            commitment_block=150,
+            source="private",
+            accepted_at="2026-05-28T14:53:28.941563+00:00",
+        )
+        state = ValidatorState(queue=[stale, current])
+        config = RunConfig(validate_hotkey_spent_since_block=None)
+
+        def registration_block(*, subtensor, config, hotkey, uid=None):
+            return 125 if hotkey == HOTKEY else 150
+
+        with patch("validate._current_registration_block", registration_block):
+            _refresh_queue(
+                chain_submissions=[],
+                config=config,
+                state=state,
+                subtensor=FakeSubtensor(""),
+            )
+
+        self.assertEqual([item.hotkey for item in state.queue], [current.hotkey])
+
     def test_published_private_submission_is_no_longer_runtime_private(self):
         submission = ValidatorSubmission(
             hotkey=HOTKEY,

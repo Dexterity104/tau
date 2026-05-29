@@ -18,10 +18,19 @@ _GITHUB_API = "https://api.github.com"
 log = logging.getLogger("swe-eval.github_miner")
 
 _RATE_LIMIT_COOLDOWN = 60  # seconds to wait before reusing a rate-limited token
+_RECENT_EVENTS_CACHE_TTL_SECONDS = 60.0
+_RECENT_EVENTS_CACHE_LOCK = threading.Lock()
+_RECENT_EVENTS_CACHE: tuple[float, list[dict]] | None = None
 
 
 def _token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
+
+
+def clear_recent_events_cache() -> None:
+    global _RECENT_EVENTS_CACHE
+    with _RECENT_EVENTS_CACHE_LOCK:
+        _RECENT_EVENTS_CACHE = None
 
 
 class GitHubTokenRotator:
@@ -282,12 +291,12 @@ class GitHubMiner:
 
     def sample_commit(self, max_attempts: int = 25) -> CommitCandidate:
         last_error: str | None = None
+        events = self._recent_push_events()
+        if not events:
+            raise ValueError("No recent push events available")
         for attempt in range(1, max_attempts + 1):
             try:
                 log.debug("Mining attempt %s/%s", attempt, max_attempts)
-                events = self._recent_push_events()
-                if not events:
-                    raise ValueError("No recent push events available")
                 event = self._rng.choice(events)
                 log.debug(
                     "Selected push event id=%s repo=%s created_at=%s",
@@ -357,6 +366,18 @@ class GitHubMiner:
         return None
 
     def _recent_push_events(self) -> list[dict]:
+        global _RECENT_EVENTS_CACHE
+        now = time.monotonic()
+        with _RECENT_EVENTS_CACHE_LOCK:
+            if _RECENT_EVENTS_CACHE is not None:
+                cached_at, events = _RECENT_EVENTS_CACHE
+                if now - cached_at < _RECENT_EVENTS_CACHE_TTL_SECONDS:
+                    return list(events)
+            events = self._fetch_recent_push_events()
+            _RECENT_EVENTS_CACHE = (time.monotonic(), list(events))
+            return list(events)
+
+    def _fetch_recent_push_events(self) -> list[dict]:
         log.debug("Fetching recent public events page 1")
         response, payload = self._get_json("/events", page=1, per_page=30, return_response=True)
         events = list(payload)

@@ -1139,10 +1139,14 @@ def run_pool_manager(config: RunConfig) -> None:
             if removed:
                 log.info("Completed local deletion for %d archived task(s)", removed)
             active_rollout_tasks = pool.names() | retest_pool.names() | active_duel_task_names(config)
-            exported_rollouts = export_retired_rollouts_to_hf(
-                config=config,
-                active_task_names=active_rollout_tasks,
-            )
+            try:
+                exported_rollouts = export_retired_rollouts_to_hf(
+                    config=config,
+                    active_task_names=active_rollout_tasks,
+                )
+            except Exception:
+                log.exception("Retired rollout export pass failed; pool manager loop will continue")
+                exported_rollouts = 0
             if exported_rollouts:
                 log.info("Exported %d retired rollout task bundle(s) to Hugging Face", exported_rollouts)
             cleanup_old_task_workspaces(config, (pool, retest_pool))

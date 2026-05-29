@@ -8,7 +8,7 @@ exec doppler run -p arbos -c dev -- \
   --solver-provider-only minimax/fp8 \
   --solver-provider-disable-fallbacks \
   --max-concurrency 1 \
-  --round-concurrency 25 \
+  --round-concurrency 50 \
   --candidate-timeout-streak-limit 10 \
   --poll-interval-seconds 600 \
   --task-pool-target 50 \

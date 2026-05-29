@@ -225,12 +225,19 @@ def _delete_keys_batch(keys: list[str]) -> int:
     return deleted
 
 
-def build_dashboard_payload(*, current_king: dict[str, Any] | None, duel_history: list[dict[str, Any]], status: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_dashboard_payload(
+    *,
+    current_king: dict[str, Any] | None,
+    duel_history: list[dict[str, Any]],
+    status: dict[str, Any] | None = None,
+    benchmarks: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "updated_at": datetime.now(tz=UTC).isoformat(),
         "current_king": current_king,
         "duels": duel_history,
         "status": status,
+        "benchmarks": benchmarks or {},
     }
 
 
@@ -324,6 +331,7 @@ def build_dashboard_summary_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "duels": [_dashboard_duel_summary(item) for item in duels if isinstance(item, dict)] if isinstance(duels, list) else [],
         "duels_total": len(duels) if isinstance(duels, list) else 0,
         "status": _dashboard_status_summary(payload.get("status"), duels if isinstance(duels, list) else []),
+        "benchmarks": payload.get("benchmarks") if isinstance(payload.get("benchmarks"), dict) else {},
         "links": {**links, "duels_html": "./duels.html", "dashboard_full": "./dashboard.json"},
     }
 
@@ -462,7 +470,14 @@ def publish_dashboard_data(
         log.warning("R2 credentials not configured; skipping dashboard publish")
         return False
 
-    payload = build_dashboard_payload(current_king=current_king, duel_history=duel_history, status=status)
+    existing = _download_dashboard_payload()
+    benchmarks = existing.get("benchmarks") if isinstance(existing.get("benchmarks"), dict) else {}
+    payload = build_dashboard_payload(
+        current_king=current_king,
+        duel_history=duel_history,
+        status=status,
+        benchmarks=benchmarks,
+    )
     home_payload = build_dashboard_home_payload(payload)
     try:
         # Short max-age so Hippius's edge cache doesn't make the dashboard
@@ -477,6 +492,44 @@ def publish_dashboard_data(
             return False
         log.exception("Failed to publish dashboard data to R2")
         return False
+
+
+def publish_benchmark_data(*, benchmark_payload: dict[str, Any]) -> bool:
+    """Merge benchmark summary data into the public dashboard objects."""
+    if _get_s3_client() is None:
+        log.warning("R2 credentials not configured; skipping benchmark publish")
+        return False
+    try:
+        dashboard = _download_dashboard_payload()
+        benchmarks = dashboard.get("benchmarks") if isinstance(dashboard.get("benchmarks"), dict) else {}
+        benchmarks.update(benchmark_payload)
+        dashboard["benchmarks"] = benchmarks
+        dashboard["updated_at"] = datetime.now(tz=UTC).isoformat()
+        home_payload = build_dashboard_home_payload(dashboard)
+        summary_payload = build_dashboard_summary_payload(dashboard)
+        _upload_json(_DASHBOARD_KEY, dashboard, cache_control="public, max-age=10")
+        _upload_json(_DASHBOARD_HOME_KEY, home_payload, cache_control="public, max-age=10")
+        _upload_json(f"{_R2_KEY_PREFIX}dashboard-summary.json", summary_payload, cache_control="public, max-age=10")
+        return True
+    except Exception as exc:
+        if _is_throttle_error(exc):
+            _note_throttle()
+            return False
+        log.exception("Failed to publish benchmark data to R2")
+        return False
+
+
+def _download_dashboard_payload() -> dict[str, Any]:
+    client = _get_s3_client()
+    if client is None:
+        return {}
+    try:
+        response = client.get_object(Bucket=_get_bucket(), Key=_DASHBOARD_KEY)
+        body = response["Body"].read()
+        payload = json.loads(body.decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
 
 def _dashboard_home_payload(payload: dict[str, Any]) -> dict[str, Any]:
