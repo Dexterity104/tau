@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 DEFAULT_OPENROUTER_MIN_SCORE = 70
 PRIVATE_SUBMISSION_ACCEPTANCE_LEDGER = "_accepted_submissions.json"
+PRIVATE_SUBMISSION_QUEUE_WAKEUP = "_queue_wakeup"
 PRIVATE_SUBMISSION_ATTEMPT_LEDGER = "_submission_attempts.json"
 MINER_HOTKEY_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}$")
 REQUIRED_SOLVE_ARGS = ("repo_path", "issue", "model", "api_base", "api_key")
@@ -523,6 +524,13 @@ def record_private_submission_acceptance(
         ),
     }
     _write_acceptance_ledger(root, ledger)
+    touch_private_submission_queue_wakeup(root=root)
+
+
+def touch_private_submission_queue_wakeup(*, root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / PRIVATE_SUBMISSION_QUEUE_WAKEUP
+    path.write_text(datetime.now(UTC).isoformat() + "\n", encoding="utf-8")
 
 
 def check_and_record_private_submission_attempt(

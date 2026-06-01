@@ -14,6 +14,7 @@ from config import RunConfig
 from solve_spend import build_solve_spend_payload
 from submission_api import rate_limit_client_ip, solve_spend_payload_for_query
 from private_submission import (
+    PRIVATE_SUBMISSION_QUEUE_WAKEUP,
     build_public_submissions_api_payload,
     check_and_record_private_submission_attempt,
     private_submission_check_passed,
@@ -645,6 +646,20 @@ class PrivateSubmissionValidatorTest(unittest.TestCase):
         _refresh_queue(chain_submissions=[submission], config=config, state=state, subtensor=None)
 
         self.assertEqual([item.commitment for item in state.queue], [submission.commitment])
+
+    def test_acceptance_record_touches_validator_queue_wakeup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            record_private_submission_acceptance(
+                root=root,
+                hotkey=HOTKEY,
+                submission_id="sub-1",
+                agent_sha256="a" * 64,
+                registration_block=100,
+            )
+
+            self.assertTrue((root / PRIVATE_SUBMISSION_QUEUE_WAKEUP).is_file())
 
     def test_private_api_submission_queue_ignores_prior_public_hotkey_spend(self):
         submission = ValidatorSubmission(

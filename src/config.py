@@ -32,6 +32,39 @@ def _env_float(*names: str) -> float | None:
     return float(value)
 
 
+def _env_bytes_default(name: str, default: int) -> int:
+    value = _env_str(name)
+    if value is None:
+        return default
+    return _parse_bytes(value)
+
+
+def _parse_bytes(value: str) -> int:
+    clean = value.strip().lower().replace("_", "")
+    if not clean:
+        raise ValueError("byte value cannot be empty")
+    units = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+        "t": 1024**4,
+        "tb": 1024**4,
+    }
+    number = clean
+    multiplier = 1
+    for suffix, scale in sorted(units.items(), key=lambda item: len(item[0]), reverse=True):
+        if suffix and clean.endswith(suffix):
+            number = clean[: -len(suffix)]
+            multiplier = scale
+            break
+    return int(float(number) * multiplier)
+
+
 def _env_bool(*names: str, default: bool = False) -> bool:
     value = _env_str(*names)
     if value is None:
@@ -191,6 +224,12 @@ class RunConfig:
     validate_task_archive_hf_dataset: str | None = field(default_factory=lambda: _env_str("VALIDATE_TASK_ARCHIVE_HF_DATASET"))
     validate_task_archive_hf_token_env: str = field(default_factory=lambda: _env_str("VALIDATE_TASK_ARCHIVE_HF_TOKEN_ENV") or "HF_TOKEN")
     validate_task_archive_per_hour: int = field(default_factory=lambda: _env_int_default("VALIDATE_TASK_ARCHIVE_PER_HOUR", 10))
+    validate_min_free_disk_bytes: int = field(
+        default_factory=lambda: _env_bytes_default("VALIDATE_MIN_FREE_DISK_BYTES", 100 * 1024**3),
+    )
+    validate_disk_cleanup_max_dirs_per_pass: int = field(
+        default_factory=lambda: _env_int_default("VALIDATE_DISK_CLEANUP_MAX_DIRS_PER_PASS", 100),
+    )
     record_rollouts: bool = field(default_factory=lambda: _env_bool("TAU_RECORD_ROLLOUTS"))
     rollout_root: Path | None = field(
         default_factory=lambda: (
@@ -203,6 +242,7 @@ class RunConfig:
     rollout_hf_dataset: str | None = field(default_factory=lambda: _env_str("TAU_ROLLOUT_HF_DATASET"))
     rollout_hf_token_env: str = field(default_factory=lambda: _env_str("TAU_ROLLOUT_HF_TOKEN_ENV") or "HF_TOKEN")
     rollout_export_format: str = field(default_factory=lambda: _env_str("TAU_ROLLOUT_EXPORT_FORMAT") or "jsonl")
+    clear_uploaded_rollouts: bool = field(default_factory=lambda: _env_bool("TAU_CLEAR_UPLOADED_ROLLOUTS"))
     validate_task_cleanup_min_age_seconds: int = 3600
     validate_weight_interval_blocks: int = 360
     validate_king_window_size: int = 5

@@ -487,6 +487,18 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--weight-interval-blocks", type=int, default=360, help="Blocks between weight sets.")
     validate.add_argument("--king-window-size", type=int, default=5, help="Number of king emission slots; default distribution is 40% current king plus 15% for each prior king slot.")
     validate.add_argument("--poll-interval-seconds", type=int, default=600, help="Seconds between chain submission refreshes.")
+    validate.add_argument(
+        "--min-free-disk-bytes",
+        type=int,
+        default=RunConfig().validate_min_free_disk_bytes,
+        help="Minimum free bytes to preserve under the task workspace filesystem by pruning old generated task dirs.",
+    )
+    validate.add_argument(
+        "--disk-cleanup-max-dirs-per-pass",
+        type=int,
+        default=RunConfig().validate_disk_cleanup_max_dirs_per_pass,
+        help="Maximum old task workspace dirs to remove per disk-pressure cleanup pass.",
+    )
     validate.add_argument("--duel-timeout", type=int, default=7200, help="Max seconds a single duel may run before being cancelled.")
     validate.add_argument("--max-duels", type=int, help="Stop after this many completed duels.")
     validate.add_argument("--min-commitment-block", type=int, default=0, help="Ignore accepted submissions before this registration block (0 = auto-set to current block at startup).")
@@ -533,6 +545,59 @@ def build_parser() -> argparse.ArgumentParser:
     pool_manager.add_argument("--task-archive-hf-token-env", default="HF_TOKEN", help="Environment variable containing the Hugging Face token.")
     pool_manager.add_argument("--task-archive-per-hour", type=int, default=10, help="Maximum newly inserted tasks to archive per pool per UTC hour.")
     pool_manager.add_argument("--poll-interval-seconds", type=int, default=10, help="Seconds between manager cleanup/retry passes.")
+    pool_manager.add_argument(
+        "--min-free-disk-bytes",
+        type=int,
+        default=RunConfig().validate_min_free_disk_bytes,
+        help="Minimum free bytes to preserve under the task workspace filesystem by pruning old generated task dirs.",
+    )
+    pool_manager.add_argument(
+        "--disk-cleanup-max-dirs-per-pass",
+        type=int,
+        default=RunConfig().validate_disk_cleanup_max_dirs_per_pass,
+        help="Maximum old task workspace dirs to remove per disk-pressure cleanup pass.",
+    )
+
+    export_task_only_hf = subparsers.add_parser(
+        "export-task-only-hf",
+        help="Create/update a Hugging Face dataset repo with task-only rows from old archived task datasets.",
+    )
+    export_task_only_hf.add_argument(
+        "--source-dataset",
+        action="append",
+        required=True,
+        help="Old Hugging Face dataset repo id to read. Repeat for multiple sources.",
+    )
+    export_task_only_hf.add_argument(
+        "--target-dataset",
+        required=True,
+        help="New Hugging Face dataset repo id to create/update, e.g. owner/tau-tasks-only.",
+    )
+    export_task_only_hf.add_argument(
+        "--source-pattern",
+        action="append",
+        help="Glob path inside each source dataset to read. Repeat for multiple patterns.",
+    )
+    export_task_only_hf.add_argument(
+        "--path-in-repo",
+        default="tasks",
+        help="Target directory or JSONL stem inside the new dataset repo.",
+    )
+    export_task_only_hf.add_argument(
+        "--shard-max-bytes",
+        type=int,
+        default=500_000_000,
+        help="Maximum uncompressed bytes per gzipped task shard before uploading.",
+    )
+    export_task_only_hf.add_argument(
+        "--hf-token-env",
+        default="HF_TOKEN",
+        help="Environment variable containing a Hugging Face token with read/write access.",
+    )
+    export_task_only_hf.add_argument("--public", action="store_true", help="Create the target dataset as public.")
+    export_task_only_hf.add_argument("--limit", type=int, help="Optional cap for smoke-testing the export.")
+    export_task_only_hf.add_argument("--dry-run", action="store_true", help="Build the projected dataset without uploading it.")
+    export_task_only_hf.add_argument("--debug", action="store_true", help="Raise exceptions instead of compact errors.")
 
     restore_r2_kings = subparsers.add_parser(
         "restore-r2-kings",
@@ -576,6 +641,51 @@ def build_parser() -> argparse.ArgumentParser:
     swebench_king.add_argument("--once", action="store_true")
     swebench_king.add_argument("--skip-scoring", action="store_true")
     swebench_king.add_argument("--debug", action="store_true")
+
+    terminal_bench_king = subparsers.add_parser(
+        "terminal-bench-king-benchmark",
+        help="Run a daemon that benchmarks each newly crowned king on Terminal-Bench.",
+    )
+    terminal_bench_king.add_argument("--validate-root", type=Path, default=Path("workspace/validate/netuid-66"))
+    terminal_bench_king.add_argument("--state-path", type=Path)
+    terminal_bench_king.add_argument("--manifest", type=Path, default=Path("data/terminal_bench_sample_10_seed66.json"))
+    terminal_bench_king.add_argument("--baseline", choices=("aider", "codex", "mini-swe-agent", "terminus", "agent-repo"), default="terminus")
+    terminal_bench_king.add_argument("--baseline-name", default="baseline")
+    terminal_bench_king.add_argument("--baseline-repo")
+    terminal_bench_king.add_argument("--baseline-ref", default="main")
+    terminal_bench_king.add_argument("--model", default="minimax/minimax-m2.7")
+    terminal_bench_king.add_argument("--api-base", default="https://openrouter.ai/api/v1")
+    terminal_bench_king.add_argument("--workers", type=int, default=10)
+    terminal_bench_king.add_argument("--agent-timeout-seconds", type=int, default=600)
+    terminal_bench_king.add_argument("--run-timeout-seconds", type=int, default=3600)
+    terminal_bench_king.add_argument("--no-rebuild", action="store_true")
+    terminal_bench_king.add_argument("--poll-interval-seconds", type=int, default=60)
+    terminal_bench_king.add_argument("--once", action="store_true")
+    terminal_bench_king.add_argument("--debug", action="store_true")
+
+    fast_king_eval = subparsers.add_parser(
+        "fast-king-eval",
+        help="Run a separate daemon for fixed 50 Terminal-Bench + 50 SWE-bench cached-baseline evals.",
+    )
+    fast_king_eval.add_argument("--validate-root", type=Path, default=Path("workspace/validate/netuid-66"))
+    fast_king_eval.add_argument("--state-path", type=Path)
+    fast_king_eval.add_argument("--terminal-manifest", type=Path, default=Path("data/terminal_bench_core_fast_50_seed66.json"))
+    fast_king_eval.add_argument("--swebench-manifest", type=Path, default=Path("data/swebench_verified_sample_50_seed66.json"))
+    fast_king_eval.add_argument("--baseline", choices=("mini-swe-agent",), default="mini-swe-agent")
+    fast_king_eval.add_argument("--model", default="minimax/minimax-m2.7")
+    fast_king_eval.add_argument("--provider-only", default="minimax/fp8")
+    fast_king_eval.add_argument("--workers", type=int, default=50)
+    fast_king_eval.add_argument("--agent-timeout-seconds", type=int, default=600)
+    fast_king_eval.add_argument("--run-timeout-seconds", type=int, default=600)
+    fast_king_eval.add_argument("--poll-interval-seconds", type=int, default=60)
+    fast_king_eval.add_argument("--api-base", default="https://openrouter.ai/api/v1")
+    fast_king_eval.add_argument("--pi-repo", default="https://github.com/earendil-works/pi")
+    fast_king_eval.add_argument("--pi-ref", default="main")
+    fast_king_eval.add_argument("--mini-swe-agent-repo", default="https://github.com/SWE-agent/mini-swe-agent")
+    fast_king_eval.add_argument("--mini-swe-agent-ref", default="main")
+    fast_king_eval.add_argument("--no-rebuild", action="store_true")
+    fast_king_eval.add_argument("--once", action="store_true")
+    fast_king_eval.add_argument("--debug", action="store_true")
     return parser
 
 
@@ -663,6 +773,29 @@ def main() -> None:
 
             run_pool_manager(config=_build_pool_manager_config(args))
             return
+        if args.command == "export-task-only-hf":
+            from task_only_hf_export import DEFAULT_SOURCE_PATTERNS, create_task_only_hf_repo
+
+            result = create_task_only_hf_repo(
+                source_datasets=tuple(args.source_dataset),
+                target_dataset=args.target_dataset,
+                token_env=args.hf_token_env,
+                source_patterns=tuple(args.source_pattern or DEFAULT_SOURCE_PATTERNS),
+                path_in_repo=args.path_in_repo,
+                shard_max_bytes=args.shard_max_bytes,
+                private=not args.public,
+                limit=args.limit,
+                dry_run=args.dry_run,
+            )
+            action = "prepared" if args.dry_run else "uploaded"
+            print(
+                f"{action} {result.exported_rows} task-only row(s) from "
+                f"{result.source_files} source file(s) as {result.uploaded_files} shard(s) "
+                f"under {result.target_dataset}/{result.path_in_repo}"
+            )
+            if result.upload_url:
+                print(result.upload_url)
+            return
         if args.command == "restore-r2-kings":
             from validate import republish_recent_kings_dashboard_to_r2
 
@@ -711,6 +844,86 @@ def main() -> None:
             if args.skip_scoring:
                 benchmark_args.append("--skip-scoring")
             swebench_crown_benchmark.main(benchmark_args)
+            return
+        if args.command == "terminal-bench-king-benchmark":
+            import terminal_bench_crown_benchmark
+
+            benchmark_args = [
+                "--validate-root",
+                str(args.validate_root),
+                "--manifest",
+                str(args.manifest),
+                "--baseline",
+                args.baseline,
+                "--baseline-name",
+                args.baseline_name,
+                "--baseline-ref",
+                args.baseline_ref,
+                "--model",
+                args.model,
+                "--api-base",
+                args.api_base,
+                "--workers",
+                str(args.workers),
+                "--agent-timeout-seconds",
+                str(args.agent_timeout_seconds),
+                "--run-timeout-seconds",
+                str(args.run_timeout_seconds),
+                "--poll-interval-seconds",
+                str(args.poll_interval_seconds),
+            ]
+            if args.state_path:
+                benchmark_args.extend(["--state-path", str(args.state_path)])
+            if args.baseline_repo:
+                benchmark_args.extend(["--baseline-repo", args.baseline_repo])
+            if args.once:
+                benchmark_args.append("--once")
+            if args.no_rebuild:
+                benchmark_args.append("--no-rebuild")
+            terminal_bench_crown_benchmark.main(benchmark_args)
+            return
+        if args.command == "fast-king-eval":
+            import fast_crown_eval
+
+            benchmark_args = [
+                "--validate-root",
+                str(args.validate_root),
+                "--terminal-manifest",
+                str(args.terminal_manifest),
+                "--swebench-manifest",
+                str(args.swebench_manifest),
+                "--baseline",
+                args.baseline,
+                "--model",
+                args.model,
+                "--provider-only",
+                args.provider_only,
+                "--workers",
+                str(args.workers),
+                "--agent-timeout-seconds",
+                str(args.agent_timeout_seconds),
+                "--run-timeout-seconds",
+                str(args.run_timeout_seconds),
+                "--poll-interval-seconds",
+                str(args.poll_interval_seconds),
+                "--api-base",
+                args.api_base,
+                "--pi-repo",
+                args.pi_repo,
+                "--pi-ref",
+                args.pi_ref,
+                "--mini-swe-agent-repo",
+                args.mini_swe_agent_repo,
+                "--mini-swe-agent-ref",
+                args.mini_swe_agent_ref,
+            ]
+            if args.state_path:
+                benchmark_args.extend(["--state-path", str(args.state_path)])
+            if args.no_rebuild:
+                benchmark_args.append("--no-rebuild")
+            if args.once:
+                benchmark_args.append("--once")
+            fast_crown_eval.main(benchmark_args)
             return
         parser.error(f"Unknown command: {args.command}")
     except Exception as exc:  # noqa: BLE001
@@ -809,6 +1022,7 @@ def _build_solve_config(args: argparse.Namespace) -> RunConfig:
         rollout_hf_dataset=args.rollout_hf_dataset or defaults.rollout_hf_dataset,
         rollout_hf_token_env=args.rollout_hf_token_env or defaults.rollout_hf_token_env,
         rollout_export_format=args.rollout_export_format or defaults.rollout_export_format,
+        clear_uploaded_rollouts=args.clear_uploaded_rollouts or defaults.clear_uploaded_rollouts,
         debug=args.debug,
     )
 
@@ -1313,6 +1527,7 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         rollout_hf_dataset=args.rollout_hf_dataset or defaults.rollout_hf_dataset,
         rollout_hf_token_env=args.rollout_hf_token_env or defaults.rollout_hf_token_env,
         rollout_export_format=args.rollout_export_format or defaults.rollout_export_format,
+        clear_uploaded_rollouts=args.clear_uploaded_rollouts or defaults.clear_uploaded_rollouts,
         validate_netuid=args.netuid,
         validate_network=args.network,
         validate_subtensor_endpoint=args.subtensor_endpoint,
@@ -1323,6 +1538,8 @@ def _build_validate_config(args: argparse.Namespace) -> RunConfig:
         validate_candidate_timeout_streak_limit=args.candidate_timeout_streak_limit,
         validate_task_pool_target=args.task_pool_target,
         validate_task_pool_static=args.task_pool_static,
+        validate_min_free_disk_bytes=args.min_free_disk_bytes,
+        validate_disk_cleanup_max_dirs_per_pass=args.disk_cleanup_max_dirs_per_pass,
         validate_weight_interval_blocks=args.weight_interval_blocks,
         validate_king_window_size=args.king_window_size,
         validate_poll_interval_seconds=args.poll_interval_seconds,
@@ -1414,6 +1631,7 @@ def _build_pool_manager_config(args: argparse.Namespace) -> RunConfig:
         rollout_hf_dataset=args.rollout_hf_dataset or defaults.rollout_hf_dataset,
         rollout_hf_token_env=args.rollout_hf_token_env or defaults.rollout_hf_token_env,
         rollout_export_format=args.rollout_export_format or defaults.rollout_export_format,
+        clear_uploaded_rollouts=args.clear_uploaded_rollouts or defaults.clear_uploaded_rollouts,
         validate_netuid=args.netuid,
         validate_network=args.network,
         validate_subtensor_endpoint=args.subtensor_endpoint,
@@ -1428,6 +1646,8 @@ def _build_pool_manager_config(args: argparse.Namespace) -> RunConfig:
         validate_task_archive_hf_token_env=args.task_archive_hf_token_env or defaults.validate_task_archive_hf_token_env,
         validate_task_archive_per_hour=args.task_archive_per_hour,
         validate_poll_interval_seconds=args.poll_interval_seconds,
+        validate_min_free_disk_bytes=args.min_free_disk_bytes,
+        validate_disk_cleanup_max_dirs_per_pass=args.disk_cleanup_max_dirs_per_pass,
         debug=args.debug,
     )
 
@@ -1761,6 +1981,11 @@ def _add_rollout_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rollout-hf-dataset", help="Hugging Face dataset repo id for public retired-task rollout exports.")
     parser.add_argument("--rollout-hf-token-env", default="HF_TOKEN", help="Environment variable containing the Hugging Face token for rollout export.")
     parser.add_argument("--rollout-export-format", default="jsonl", choices=("jsonl",), help="Rollout export format.")
+    parser.add_argument(
+        "--clear-uploaded-rollouts",
+        action="store_true",
+        help="Delete local rollout task directories after they are uploaded to Hugging Face and no longer active.",
+    )
 
 
 def _load_dotenv() -> None:

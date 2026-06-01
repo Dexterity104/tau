@@ -219,7 +219,10 @@ def solve_task_in_docker(
                         _kill_container(container_id)
                         container_force_killed = True
                     else:
-                        solution_diff = _collect_repo_patch_from_container(container_id=container_id)
+                        collected_patch = _collect_repo_patch_from_container_best_effort(
+                            container_id=container_id,
+                        )
+                        solution_diff = collected_patch or ""
                         if not solution_diff.strip() and solver_run.reported_patch:
                             solution_diff = solver_run.reported_patch
                         solution_diff = _redact_sensitive_text(solution_diff, sensitive_values)
@@ -707,12 +710,12 @@ def _file_sha256(path: Path) -> str:
 
 
 def _read_runner_events_from_container(*, container_id: str) -> str:
-    result = _run(
+    result = _run_best_effort(
         ["docker", "exec", container_id, "bash", "-lc", f"cat {_CONTAINER_RUNNER_EVENTS_FILE} 2>/dev/null || true"],
         timeout=30,
-        check=False,
+        action="read runner events",
     )
-    return result.stdout or ""
+    return result.stdout if result is not None else ""
 
 
 def _parse_runner_events(raw_output: str | None) -> list[dict[str, Any]]:
@@ -730,11 +733,19 @@ def _parse_runner_events(raw_output: str | None) -> list[dict[str, Any]]:
 
 
 def _remove_container(container_id: str) -> None:
-    _run(["docker", "rm", "-f", container_id], timeout=30, check=False)
+    _run_best_effort(
+        ["docker", "rm", "-f", container_id],
+        timeout=30,
+        action="remove container",
+    )
 
 
 def _kill_container(container_id: str) -> None:
-    _run(["docker", "kill", container_id], timeout=30, check=False)
+    _run_best_effort(
+        ["docker", "kill", container_id],
+        timeout=30,
+        action="kill container",
+    )
 
 
 def _stop_solver_processes(*, container_id: str) -> None:
@@ -781,10 +792,10 @@ def _stop_solver_processes(*, container_id: str) -> None:
             time.sleep(0.5)
         """,
     ).strip()
-    _run(
+    _run_best_effort(
         ["docker", "exec", container_id, "python3", "-c", stop_script],
         timeout=15,
-        check=False,
+        action="stop solver processes",
     )
 
 
@@ -828,6 +839,24 @@ def _run(
         output = ((result.stdout or "") + (result.stderr or "")).strip()
         raise RuntimeError(f"Command failed ({' '.join(cmd[:3])}): {output[-500:]}")
     return result
+
+
+def _run_best_effort(
+    cmd: list[str],
+    *,
+    timeout: int,
+    action: str,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return _run(cmd, cwd=cwd, timeout=timeout, check=False)
+    except Exception as exc:
+        log.warning(
+            "Best-effort Docker %s failed (non-fatal): %s",
+            action,
+            exc,
+        )
+        return None
 
 
 def _docker_start_slots(limit: int) -> list[Path]:
@@ -875,19 +904,25 @@ def _build_solver_command(*, use_proxy_bridge: bool) -> str:
     if use_proxy_bridge:
         proxy_ready_check = shlex.quote(
             'import os, socket; '
-            'sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); '
-            'sock.settimeout(0.1); '
-            'sock.connect(("127.0.0.1", int(os.environ["TAU_PROXY_LISTEN_PORT"]))); '
+            'sock = socket.create_connection(("127.0.0.1", int(os.environ["TAU_PROXY_LISTEN_PORT"])), timeout=0.2); '
             'sock.close()',
         )
         # Use semicolon before '&' so the PATH export stays in the main shell.
         # 'cmd1 && cmd2 &' backgrounds both; 'cmd1; cmd2 &' only backgrounds cmd2.
         prefix = (
-            'python3 "$TAU_PROXY_BRIDGE" & BRIDGE_PID=$!'
+            'BRIDGE_LOG=/tmp/tau_proxy_bridge.log'
+            + ' && : > "$BRIDGE_LOG"'
+            + ' && { python3 "$TAU_PROXY_BRIDGE" 2>"$BRIDGE_LOG" & BRIDGE_PID=$!; }'
             + " && trap 'kill $BRIDGE_PID >/dev/null 2>&1 || true' EXIT"
-            + ' && for _ in $(seq 1 50); do '
-            + f'python3 -c {proxy_ready_check} && break || sleep 0.1; '
+            + ' && BRIDGE_READY=0'
+            + ' && for _ in $(seq 1 100); do '
+            + f'python3 -c {proxy_ready_check} >/dev/null 2>&1 && BRIDGE_READY=1 && break || sleep 0.1; '
             + 'done'
+            + ' && if [ "$BRIDGE_READY" != 1 ]; then '
+            + 'echo "Docker tau solver proxy bridge did not become ready" >&2; '
+            + 'cat "$BRIDGE_LOG" >&2; '
+            + 'exit 1; '
+            + 'fi'
         )
     return " && ".join([prefix, _clean_harness_command()])
 
@@ -1791,6 +1826,17 @@ def _collect_repo_patch_from_container(*, container_id: str) -> str:
         output = ((result.stdout or "") + (result.stderr or "")).strip()
         raise RuntimeError(f"Failed to collect solver patch from container: {output[-500:]}")
     return result.stdout or ""
+
+
+def _collect_repo_patch_from_container_best_effort(*, container_id: str) -> str | None:
+    try:
+        return _collect_repo_patch_from_container(container_id=container_id)
+    except Exception as exc:
+        log.warning(
+            "Best-effort Docker collect solver patch failed (non-fatal): %s",
+            exc,
+        )
+        return None
 
 
 def _find_repo_symlinks_in_container(*, container_id: str) -> str | None:

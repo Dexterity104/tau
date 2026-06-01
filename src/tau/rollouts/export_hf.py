@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,6 +63,44 @@ def exported_task_hf_path(manifest: dict[str, Any], task_name: str) -> str | Non
         return None
     path = entry.get("hf_path")
     return str(path) if path else None
+
+
+def uploaded_local_rollout_task_names(
+    *,
+    root: Path,
+    active_task_names: set[str],
+    manifest: dict[str, Any] | None = None,
+) -> list[str]:
+    current_manifest = manifest or load_export_manifest(root)
+    local_task_names = local_rollout_task_names(root)
+    active_names = set(active_task_names)
+    return [
+        task_name
+        for task_name in sorted(local_task_names - active_names)
+        if exported_task_hf_path(current_manifest, task_name)
+    ]
+
+
+def clear_uploaded_rollout_tasks(
+    *,
+    root: Path,
+    active_task_names: set[str],
+    max_dirs: int,
+) -> int:
+    if max_dirs <= 0:
+        return 0
+    task_names = uploaded_local_rollout_task_names(
+        root=root,
+        active_task_names=active_task_names,
+    )
+    count = 0
+    for task_name in task_names[:max_dirs]:
+        task_dir = root / "tasks" / task_name
+        if not task_dir.is_dir():
+            continue
+        shutil.rmtree(task_dir)
+        count += 1
+    return count
 
 
 def mark_task_rollouts_exported(

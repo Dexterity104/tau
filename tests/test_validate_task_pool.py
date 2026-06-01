@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import time
@@ -176,6 +177,53 @@ class TaskPoolTest(unittest.TestCase):
             self.assertTrue(paths.pool_dir.exists())
             self.assertTrue(paths.retest_pool_dir.exists())
             self.assertNotEqual(paths.pool_dir, paths.retest_pool_dir)
+
+    def test_disk_pressure_cleanup_removes_oldest_unkept_tasks_until_healthy(self):
+        with tempfile.TemporaryDirectory() as td:
+            tasks_root = Path(td)
+            old_task = tasks_root / "validate-20260101000000-000001"
+            kept_task = tasks_root / "validate-20260101000000-000002"
+            newer_task = tasks_root / "validate-20260101000000-000003"
+            ignored_task = tasks_root / "manual-task"
+            for task_dir in (old_task, kept_task, newer_task, ignored_task):
+                task_dir.mkdir()
+
+            now = time.time()
+            for offset, task_dir in enumerate((old_task, kept_task, newer_task, ignored_task)):
+                ts = now + offset
+                task_dir.touch()
+                os.utime(task_dir, (ts, ts))
+
+            samples = iter([10, 10, 200])
+
+            removed = validate._cleanup_tasks_until_disk_headroom(
+                tasks_root=tasks_root,
+                min_free_bytes=100,
+                keep_names={kept_task.name},
+                max_dirs_per_pass=10,
+                free_bytes=lambda _path: next(samples),
+            )
+
+            self.assertEqual(removed, 2)
+            self.assertFalse(old_task.exists())
+            self.assertTrue(kept_task.exists())
+            self.assertFalse(newer_task.exists())
+            self.assertTrue(ignored_task.exists())
+
+    def test_disk_pressure_cleanup_does_nothing_when_headroom_is_available(self):
+        with tempfile.TemporaryDirectory() as td:
+            tasks_root = Path(td)
+            task_dir = tasks_root / "validate-20260101000000-000001"
+            task_dir.mkdir()
+
+            removed = validate._cleanup_tasks_until_disk_headroom(
+                tasks_root=tasks_root,
+                min_free_bytes=100,
+                free_bytes=lambda _path: 200,
+            )
+
+            self.assertEqual(removed, 0)
+            self.assertTrue(task_dir.exists())
 
     def test_take_returns_fastest_cached_task(self):
         with tempfile.TemporaryDirectory() as td:

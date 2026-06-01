@@ -515,6 +515,11 @@ def publish_benchmark_data(*, benchmark_payload: dict[str, Any]) -> bool:
         _upload_json(_DASHBOARD_KEY, dashboard, cache_control="public, max-age=10")
         _upload_json(_DASHBOARD_HOME_KEY, home_payload, cache_control="public, max-age=10")
         _upload_json(f"{_R2_KEY_PREFIX}dashboard-summary.json", summary_payload, cache_control="public, max-age=10")
+        _upload_json(
+            f"{_R2_KEY_PREFIX}swebench-local.json",
+            _public_swebench_payload(benchmarks),
+            cache_control="public, max-age=10",
+        )
         return True
     except Exception as exc:
         if _is_throttle_error(exc):
@@ -522,6 +527,27 @@ def publish_benchmark_data(*, benchmark_payload: dict[str, Any]) -> bool:
             return False
         log.exception("Failed to publish benchmark data to R2")
         return False
+
+
+def _public_swebench_payload(benchmarks: dict[str, Any]) -> dict[str, Any]:
+    swebench = benchmarks.get("swebench_verified") if isinstance(benchmarks, dict) else {}
+    latest = swebench.get("latest") if isinstance(swebench, dict) and isinstance(swebench.get("latest"), dict) else None
+    normalized = _normalize_public_swebench_latest(latest)
+    return {"latest": normalized, "active": normalized}
+
+
+def _normalize_public_swebench_latest(latest: dict[str, Any] | None) -> dict[str, Any] | None:
+    if latest is None or isinstance(latest.get("scores"), dict):
+        return latest
+    return {
+        **latest,
+        "scores": {
+            "king": latest.get("king"),
+            "baseline": latest.get("baseline") or latest.get("pi"),
+            "pi": latest.get("pi"),
+            "delta_pass_rate": latest.get("delta_pass_rate"),
+        },
+    }
 
 
 def _download_dashboard_payload() -> dict[str, Any]:

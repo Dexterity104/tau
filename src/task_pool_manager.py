@@ -19,6 +19,7 @@ from typing import Any, Sequence
 from config import RunConfig
 from pipeline import compare_task_run, generate_task_run, solve_task_run
 from tau.rollouts.export_hf import (
+    clear_uploaded_rollout_tasks,
     export_retired_rollouts_to_hf,
     export_task_rollouts_to_hf,
     rollout_export_enabled,
@@ -500,13 +501,15 @@ def archive_pool_task_to_hf_jsonl(
             hf_path=hf_path,
             archive_reason=archive_reason,
         )
+        deleted = retry_pending_archived_task_deletes(config, (pool,))
         lease_note = "; active lease snapshot existed" if task.task_name in leased_task_names else ""
         log.info(
-            "Task archive[%s]: uploaded %s to %s (%s); removed from pool and deferred local delete%s",
+            "Task archive[%s]: uploaded %s to %s (%s); removed from pool and deleted %d archived local task(s)%s",
             pool_label,
             task.task_name,
             hf_path,
             upload_url,
+            deleted,
             lease_note,
         )
 
@@ -608,14 +611,16 @@ def _upload_pending_archive_batch(
             archive_reason=str(entry.get("archive_reason") or "rotation"),
         )
         completed += 1
+    deleted = retry_pending_archived_task_deletes(config, (pool,))
     leased_count = len([name for name in task_names if name in leased_names])
     lease_note = f"; {leased_count} active lease snapshot(s) existed" if leased_count else ""
     log.info(
-        "Task archive[%s]: uploaded %d task(s) to %s (%s); removed from pool and deferred local delete%s",
+        "Task archive[%s]: uploaded %d task(s) to %s (%s); removed from pool and deleted %d archived local task(s)%s",
         pool_label,
         completed,
         hf_path,
         upload_url,
+        deleted,
         lease_note,
     )
     return completed
@@ -787,7 +792,7 @@ def retry_failed_task_uploads(
 def retry_pending_archived_task_deletes(config: RunConfig, pools: Sequence[v.TaskPool]) -> int:
     leased_names = active_duel_task_names(config)
     now = datetime.now(tz=UTC)
-    grace_seconds = max(0, int(config.validate_poll_interval_seconds))
+    grace_seconds = 0
     ledger_path = task_archive_ledger_path(config)
     removed = 0
     with _TASK_ARCHIVE_LOCK:
@@ -1238,6 +1243,12 @@ def cleanup_old_task_workspaces(config: RunConfig, pools: Sequence[v.TaskPool]) 
         keep_names=keep_names,
         min_age_seconds=config.validate_task_cleanup_min_age_seconds,
     )
+    v._cleanup_tasks_until_disk_headroom(
+        tasks_root=config.tasks_root,
+        min_free_bytes=config.validate_min_free_disk_bytes,
+        keep_names=keep_names,
+        max_dirs_per_pass=config.validate_disk_cleanup_max_dirs_per_pass,
+    )
 
 
 def _pool_worker_loop(
@@ -1335,5 +1346,17 @@ def run_pool_manager(config: RunConfig) -> None:
                 exported_rollouts = 0
             if exported_rollouts:
                 log.info("Exported %d retired rollout task bundle(s) to Hugging Face", exported_rollouts)
+            if config.clear_uploaded_rollouts:
+                try:
+                    cleared_rollouts = clear_uploaded_rollout_tasks(
+                        root=config.resolved_rollout_root(),
+                        active_task_names=active_rollout_tasks,
+                        max_dirs=config.validate_disk_cleanup_max_dirs_per_pass,
+                    )
+                except Exception:
+                    log.exception("Uploaded rollout cleanup pass failed; pool manager loop will continue")
+                    cleared_rollouts = 0
+                if cleared_rollouts:
+                    log.info("Cleared %d uploaded rollout task bundle(s) from local disk", cleared_rollouts)
             cleanup_old_task_workspaces(config, (pool, retest_pool))
             stop_event.wait(max(1, int(config.validate_poll_interval_seconds)))

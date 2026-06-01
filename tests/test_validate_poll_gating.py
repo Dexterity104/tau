@@ -1,10 +1,16 @@
 import unittest
 from unittest.mock import Mock
+from pathlib import Path
+import tempfile
 
+from config import RunConfig
+from private_submission import touch_private_submission_queue_wakeup
 from validate import (
     _POOL_FILLER_RATE_LIMIT_BACKOFF_BUFFER_SECONDS,
     _POOL_FILLER_RATE_LIMIT_BACKOFF_SECONDS,
     _github_rate_limit_backoff_seconds,
+    _pool_gate_sleep_seconds,
+    _sleep_until_poll_or_private_submission_wakeup,
     _remaining_poll_sleep_seconds,
     _should_refresh_chain_submissions,
 )
@@ -58,6 +64,37 @@ class ValidatePollGatingTest(unittest.TestCase):
             _remaining_poll_sleep_seconds(started_at=100.0, interval_seconds=600, now=700.0),
             0.0,
         )
+
+    def test_pool_gate_sleep_caps_queued_work_only(self):
+        self.assertEqual(
+            _pool_gate_sleep_seconds(started_at=100.0, interval_seconds=600, queued=True, now=250.0),
+            15.0,
+        )
+        self.assertEqual(
+            _pool_gate_sleep_seconds(started_at=100.0, interval_seconds=600, queued=False, now=250.0),
+            450.0,
+        )
+
+    def test_sleep_returns_early_on_private_submission_wakeup(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(
+                workspace_root=Path(td),
+                validate_private_submission_root=Path(td) / "private-submissions",
+            )
+
+            touch_private_submission_queue_wakeup(root=config.validate_private_submission_root)
+
+            def wake_after_first_sleep(seconds):
+                touch_private_submission_queue_wakeup(root=config.validate_private_submission_root)
+
+            with unittest.mock.patch("validate.time.sleep", side_effect=wake_after_first_sleep):
+                self.assertTrue(
+                    _sleep_until_poll_or_private_submission_wakeup(
+                        config=config,
+                        seconds=600,
+                        last_seen_mtime=0.0,
+                    )
+                )
 
     def test_github_rate_limit_backoff_prefers_retry_after_with_floor(self):
         response = Mock(headers={"retry-after": "45"})

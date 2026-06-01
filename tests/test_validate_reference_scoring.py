@@ -166,6 +166,14 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertEqual(result.challenger_score, 1.0)
         self.assertIn("candidate_a", result.rationale)
 
+    def test_diff_judge_static_prompt_injection_allows_domain_terms(self):
+        result = _diff_judge_prompt_injection_result(
+            king_patch="+grader = cert.grader\n",
+            challenger_patch="+reward_model = model_name\n",
+        )
+
+        self.assertIsNone(result)
+
     def test_diff_judge_falls_back_to_kimi_on_sonnet_route_error(self):
         calls = []
 

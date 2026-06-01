@@ -14,9 +14,12 @@ import docker_solver
 from tau.rollouts.export_dpo import dpo_row
 from tau.rollouts.export_grpo import grpo_row
 from tau.rollouts.export_hf import (
+    clear_uploaded_rollout_tasks,
     export_retired_rollouts_to_hf,
     export_task_rollouts_to_hf,
     load_export_manifest,
+    mark_task_rollouts_exported,
+    uploaded_local_rollout_task_names,
 )
 from tau.rollouts.ids import event_id, rollout_id
 from tau.rollouts.schema import build_llm_event, build_rollout_record
@@ -205,6 +208,46 @@ class RolloutHelpersTest(unittest.TestCase):
             manifest_tasks = load_export_manifest(root)["tasks"]
             self.assertNotIn("task-a", manifest_tasks)
             self.assertIn("task-b", manifest_tasks)
+
+    def test_clear_uploaded_rollouts_only_removes_retired_exported_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "rollouts"
+            for task_name in ("uploaded-task", "active-task", "local-only-task"):
+                append_rollout(root, {
+                    "schema_version": 1,
+                    "rollout_id": f"rol_{task_name}",
+                    "task_name": task_name,
+                    "trajectory": [],
+                    "issue": task_name,
+                })
+
+            mark_task_rollouts_exported(
+                root,
+                task_name="uploaded-task",
+                path_in_repo="rollouts/2026-01-01-00/uploaded-task.jsonl.gz",
+            )
+            mark_task_rollouts_exported(
+                root,
+                task_name="active-task",
+                path_in_repo="rollouts/2026-01-01-00/active-task.jsonl.gz",
+            )
+
+            uploaded_retired = uploaded_local_rollout_task_names(
+                root=root,
+                active_task_names={"active-task"},
+            )
+            cleared = clear_uploaded_rollout_tasks(
+                root=root,
+                active_task_names={"active-task"},
+                max_dirs=10,
+            )
+
+            self.assertEqual(uploaded_retired, ["uploaded-task"])
+            self.assertEqual(cleared, 1)
+            self.assertFalse((root / "tasks" / "uploaded-task").exists())
+            self.assertTrue((root / "tasks" / "active-task").exists())
+            self.assertTrue((root / "tasks" / "local-only-task").exists())
+            self.assertIn("uploaded-task", load_export_manifest(root)["tasks"])
 
     def test_trajectory_events_are_time_ordered_before_ids(self):
         record = build_rollout_record(

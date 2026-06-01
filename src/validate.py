@@ -27,7 +27,11 @@ import httpx
 from config import RunConfig, SolverAgentSource
 from openrouter_client import complete_text
 from pipeline import _setup_logging, compare_task_run, solve_task_run
-from private_submission import accepted_private_submission_entries, private_submission_check_passed
+from private_submission import (
+    PRIVATE_SUBMISSION_QUEUE_WAKEUP,
+    accepted_private_submission_entries,
+    private_submission_check_passed,
+)
 from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
 from tau.rollouts.store import update_rollout
 from r2 import (
@@ -83,6 +87,32 @@ _DIFF_JUDGE_ATTEMPTS = 4
 _DIFF_JUDGE_MAX_CONCURRENCY = 25
 _DIFF_JUDGE_CACHE_CONTROL = {"type": "ephemeral"}
 _DIFF_JUDGE_MODELS = (_DIFF_JUDGE_MODEL, *_DIFF_JUDGE_FALLBACK_MODELS)
+_DIFF_JUDGE_INSTRUCTION_PREFIXES = (
+    "ignore previous instructions",
+    "ignore prior instructions",
+    "ignore the above instructions",
+)
+_DIFF_JUDGE_MANIPULATION_PERSONAS = (
+    "evaluator",
+    "judge",
+)
+_DIFF_JUDGE_WIN_VERBS = (
+    "choose",
+    "pick",
+    "select",
+)
+_DIFF_JUDGE_WIN_TARGETS = (
+    "king",
+    "challenger",
+    "candidate_a",
+    "candidate_b",
+)
+_DIFF_JUDGE_ASSERTION_TARGETS = (
+    "king",
+    "challenger",
+    "candidate_a",
+    "candidate_b",
+)
 _MIN_PATCH_LINES = 100
 _MIN_DUEL_TASKS = 50
 _COPY_MEAN_SIMILARITY_THRESHOLD = 0.90
@@ -95,6 +125,7 @@ _MIN_POOL_BASELINE_LINES = 1
 _PARALLEL_DUEL_PER_ROUND_TIMEOUT = 300.0
 _PARALLEL_DUEL_HARD_TIMEOUT = 3600.0
 _GRACEFUL_DUEL_SHUTDOWN_SECONDS = 300.0
+_QUEUED_POOL_GATE_SLEEP_SECONDS = 15.0
 _MIN_DUEL_AGENT_TIMEOUT_SECONDS = 120
 _MAX_DUEL_AGENT_TIMEOUT_SECONDS = 600
 _DUEL_AGENT_TIMEOUT_PROVIDER_SLOWDOWN_FACTOR = 1.5
@@ -1945,43 +1976,7 @@ def _diff_judge_prompt_injection_result(
 
 def _find_diff_judge_prompt_injection(patch_text: str) -> str | None:
     lowered = patch_text.lower()
-    suspicious_phrases = (
-        "ignore previous instructions",
-        "ignore prior instructions",
-        "ignore the above instructions",
-        "as the evaluator",
-        "as the judge",
-        "dear evaluator",
-        "dear judge",
-        "choose king",
-        "choose challenger",
-        "choose candidate_a",
-        "choose candidate_b",
-        "pick king",
-        "pick challenger",
-        "pick candidate_a",
-        "pick candidate_b",
-        "select king",
-        "select challenger",
-        "select candidate_a",
-        "select candidate_b",
-        "king is correct",
-        "challenger is correct",
-        "candidate_a is correct",
-        "candidate_b is correct",
-        "king wins",
-        "challenger wins",
-        "candidate_a wins",
-        "candidate_b wins",
-        "the evaluator should",
-        "the judge should",
-        "other candidate is malicious",
-        "the other candidate is malicious",
-        "automatic fail",
-        "grader",
-        "reward model",
-    )
-    for phrase in suspicious_phrases:
+    for phrase in _diff_judge_prompt_injection_phrases():
         if phrase in lowered:
             index = lowered.index(phrase)
             start = max(0, index - 60)
@@ -1989,6 +1984,25 @@ def _find_diff_judge_prompt_injection(patch_text: str) -> str | None:
             snippet = " ".join(patch_text[start:end].split())
             return f"suspicious phrase `{phrase}` in patch snippet: {snippet}"
     return None
+
+
+def _diff_judge_prompt_injection_phrases() -> tuple[str, ...]:
+    return (
+        *_DIFF_JUDGE_INSTRUCTION_PREFIXES,
+        *(f"as the {role}" for role in _DIFF_JUDGE_MANIPULATION_PERSONAS),
+        *(f"dear {role}" for role in _DIFF_JUDGE_MANIPULATION_PERSONAS),
+        *(
+            f"{verb} {target}"
+            for verb in _DIFF_JUDGE_WIN_VERBS
+            for target in _DIFF_JUDGE_WIN_TARGETS
+        ),
+        *(f"{target} is correct" for target in _DIFF_JUDGE_ASSERTION_TARGETS),
+        *(f"{target} wins" for target in _DIFF_JUDGE_ASSERTION_TARGETS),
+        *(f"the {role} should" for role in _DIFF_JUDGE_MANIPULATION_PERSONAS),
+        "other candidate is malicious",
+        "the other candidate is malicious",
+        "automatic fail",
+    )
 
 
 def _extract_json_object(raw_output: str) -> dict[str, Any] | None:
@@ -4070,11 +4084,20 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
     duel_count = 0
     poll_interval_seconds = max(1, int(config.validate_poll_interval_seconds))
     last_submission_refresh_block: int | None = None
+    last_private_submission_wakeup_mtime = _private_submission_queue_wakeup_mtime(config)
     active_duel_info: dict[str, Any] | None = None
 
     def _refresh_chain_inputs(*, subtensor, force: bool = False, reason: str = "scheduled") -> int:
-        nonlocal chain_data, last_submission_refresh_block
+        nonlocal chain_data, last_private_submission_wakeup_mtime, last_submission_refresh_block
         current_block = subtensor.block
+        wakeup_mtime = _private_submission_queue_wakeup_mtime(config)
+        wakeup_changed = (
+            wakeup_mtime is not None
+            and (
+                last_private_submission_wakeup_mtime is None
+                or wakeup_mtime > last_private_submission_wakeup_mtime
+            )
+        )
 
         log.info(
             "Poll: block=%s king=%s queue=%d pool=%d reason=%s",
@@ -4103,7 +4126,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
         before = len(state.queue)
         chain_data = fetch_chain_data(config.validate_netuid) or chain_data
         if _should_refresh_chain_submissions(
-            force=force,
+            force=force or wakeup_changed,
             current_block=current_block,
             last_refresh_block=last_submission_refresh_block,
             interval_blocks=config.validate_weight_interval_blocks,
@@ -4121,6 +4144,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                 subtensor=subtensor,
             )
             last_submission_refresh_block = current_block
+            last_private_submission_wakeup_mtime = wakeup_mtime
             added = len(state.queue) - before
             if added:
                 log.info("Queue refresh added %d candidate(s); queue=%d", added, len(state.queue))
@@ -4332,12 +4356,15 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     except Exception:
                         log.exception("Pre-duel set_weights failed (non-fatal, will retry next interval)")
 
-                pools_ready, pool_gate_reasons = _both_static_pools_ready_for_king(
-                    config=config,
-                    king=state.current_king,
-                    pool=pool,
-                    retest_pool=retest_pool,
-                )
+                pools_ready = True
+                pool_gate_reasons: list[str] = []
+                if not state.queue:
+                    pools_ready, pool_gate_reasons = _both_static_pools_ready_for_king(
+                        config=config,
+                        king=state.current_king,
+                        pool=pool,
+                        retest_pool=retest_pool,
+                    )
                 if not pools_ready:
                     now = time.monotonic()
                     if now - last_pool_gate_log_at >= 30.0:
@@ -4347,12 +4374,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             "; ".join(pool_gate_reasons),
                         )
                         last_pool_gate_log_at = now
-                    sleep_seconds = _remaining_poll_sleep_seconds(
+                    sleep_seconds = _pool_gate_sleep_seconds(
                         started_at=loop_started_at,
                         interval_seconds=poll_interval_seconds,
+                        queued=False,
                     )
                     if sleep_seconds > 0:
-                        time.sleep(sleep_seconds)
+                        _sleep_until_poll_or_private_submission_wakeup(
+                            config=config,
+                            seconds=sleep_seconds,
+                            last_seen_mtime=last_private_submission_wakeup_mtime,
+                        )
                     continue
 
                 # --- Candidate processing: continuously drain queue order ---
@@ -4440,6 +4472,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 _save_state(paths.state_path, state)
                             except Exception:
                                 log.exception("Pool-gated queue restore save failed (non-fatal)")
+                            sleep_seconds = _pool_gate_sleep_seconds(
+                                started_at=loop_started_at,
+                                interval_seconds=poll_interval_seconds,
+                                queued=True,
+                            )
+                            if sleep_seconds > 0:
+                                _sleep_until_poll_or_private_submission_wakeup(
+                                    config=config,
+                                    seconds=sleep_seconds,
+                                    last_seen_mtime=last_private_submission_wakeup_mtime,
+                                )
                             break
                         if duel_id is None:
                             duel_id = state.next_duel_index
@@ -5007,6 +5050,12 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                     break
 
                 log.debug("Task cleanup delegated to external pool-manager process")
+                _cleanup_tasks_until_disk_headroom(
+                    tasks_root=config.tasks_root,
+                    min_free_bytes=config.validate_min_free_disk_bytes,
+                    keep_names=_active_duel_task_names(state),
+                    max_dirs_per_pass=config.validate_disk_cleanup_max_dirs_per_pass,
+                )
                 _cleanup_orphaned_containers()
 
               except KeyboardInterrupt:
@@ -5019,7 +5068,11 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                   interval_seconds=poll_interval_seconds,
               )
               if sleep_seconds > 0:
-                  time.sleep(sleep_seconds)
+                  _sleep_until_poll_or_private_submission_wakeup(
+                      config=config,
+                      seconds=sleep_seconds,
+                      last_seen_mtime=last_private_submission_wakeup_mtime,
+                  )
 
     finally:
         github_client.close()
@@ -6967,6 +7020,55 @@ def _remaining_poll_sleep_seconds(
     return max(0.0, float(interval_seconds) - elapsed)
 
 
+def _pool_gate_sleep_seconds(
+    *,
+    started_at: float,
+    interval_seconds: int | float,
+    queued: bool,
+    now: float | None = None,
+) -> float:
+    sleep_seconds = _remaining_poll_sleep_seconds(
+        started_at=started_at,
+        interval_seconds=interval_seconds,
+        now=now,
+    )
+    if not queued:
+        return sleep_seconds
+    return min(sleep_seconds, _QUEUED_POOL_GATE_SLEEP_SECONDS)
+
+
+def _private_submission_queue_wakeup_mtime(config: RunConfig) -> float | None:
+    root = _private_submission_root(config)
+    if root is None:
+        return None
+    path = root / PRIVATE_SUBMISSION_QUEUE_WAKEUP
+    try:
+        return path.stat().st_mtime
+    except FileNotFoundError:
+        return None
+    except OSError:
+        log.exception("Could not stat private submission queue wakeup marker %s", path)
+        return None
+
+
+def _sleep_until_poll_or_private_submission_wakeup(
+    *,
+    config: RunConfig,
+    seconds: float,
+    last_seen_mtime: float | None,
+    max_slice_seconds: float = 5.0,
+) -> bool:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(max_slice_seconds, remaining))
+        current_mtime = _private_submission_queue_wakeup_mtime(config)
+        if current_mtime is not None and (last_seen_mtime is None or current_mtime > last_seen_mtime):
+            return True
+
+
 def _retire_hotkey(state, hotkey):
     if hotkey not in state.retired_hotkeys:
         state.retired_hotkeys.append(hotkey)
@@ -7903,6 +8005,75 @@ def _cleanup_old_tasks(
                     log.exception("cleanup on_progress callback failed (non-fatal)")
     except Exception:
         log.exception("Task cleanup failed (non-fatal)")
+
+
+def _task_cleanup_candidates(
+    *,
+    tasks_root: Path,
+    keep_names: set[str],
+) -> list[Path]:
+    return [
+        task_dir
+        for task_dir in sorted(
+            tasks_root.glob("validate-*"),
+            key=lambda path: _path_mtime(path),
+        )
+        if task_dir.name not in keep_names
+    ]
+
+
+def _path_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _disk_free_bytes(path: Path) -> int:
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return shutil.disk_usage(probe).free
+
+
+def _cleanup_tasks_until_disk_headroom(
+    *,
+    tasks_root: Path,
+    min_free_bytes: int,
+    keep_names: set[str] | None = None,
+    max_dirs_per_pass: int = 100,
+    free_bytes: Any = _disk_free_bytes,
+) -> int:
+    if min_free_bytes <= 0 or max_dirs_per_pass <= 0:
+        return 0
+    try:
+        current_free = free_bytes(tasks_root)
+        if current_free >= min_free_bytes:
+            return 0
+        candidates = _task_cleanup_candidates(
+            tasks_root=tasks_root,
+            keep_names=keep_names or set(),
+        )
+        removed = 0
+        log.warning(
+            "Disk pressure: %s has %.1f GiB free, below %.1f GiB; pruning up to %d old task dirs",
+            tasks_root,
+            current_free / 1024**3,
+            min_free_bytes / 1024**3,
+            max_dirs_per_pass,
+        )
+        for task_dir in candidates[:max_dirs_per_pass]:
+            shutil.rmtree(task_dir, ignore_errors=True)
+            removed += 1
+            log.info("Disk pressure cleanup removed task dir: %s", task_dir.name)
+            if free_bytes(tasks_root) >= min_free_bytes:
+                break
+        if removed == 0:
+            log.warning("Disk pressure cleanup found no safe task dirs to remove under %s", tasks_root)
+        return removed
+    except Exception:
+        log.exception("Disk pressure cleanup failed (non-fatal)")
+        return 0
 
 def _cleanup_orphaned_containers(max_age: int = 3600, max_containers: int = 100) -> None:
     try:
