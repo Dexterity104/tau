@@ -56,7 +56,7 @@ from workspace import (
     write_json,
 )
 
-from tau.io.github import GitHubClient
+from tau.io.github import GitHubClient, GitHubAuthRotatingClient
 
 log = logging.getLogger("swe-eval.validate")
 _DEFAULT_GITHUB_AGENT_FILE = "agent.py"
@@ -160,21 +160,6 @@ def _split_github_tokens(raw: str | None) -> list[str]:
     return [token.strip() for token in (raw or "").split(",") if token.strip()]
 
 
-def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        ordered.append(value)
-    return ordered
-
-
-def _token_fingerprint(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
-
-
 _CLIENT_CACHE_NONCE_LOCK = threading.Lock()
 _CLIENT_CACHE_NONCE_COUNTER = 0
 
@@ -210,130 +195,6 @@ def _github_cache_namespace(client: httpx.Client) -> str:
         if value:
             return str(value)
     return f"client:{_client_cache_nonce(client)}"
-
-
-class _GitHubAuthRotatingClient(GitHubClient):
-    """Small GitHub client wrapper with token rotation and 401 blacklisting."""
-
-    def __init__(
-        self,
-        *,
-        base_headers: dict[str, str],
-        timeout: float,
-        tokens: Sequence[str],
-        rotate: bool,
-        user_agent: str,
-    ) -> None:
-        self._client = httpx.Client(
-            base_url="https://api.github.com",
-            headers=base_headers,
-            follow_redirects=True,
-            timeout=timeout,
-        )
-        self._tokens = _dedupe_preserve_order([token for token in tokens if token])
-        self._rotate = rotate
-        self._user_agent = user_agent
-        self._lock = threading.Lock()
-        self._next_index = 0
-        self._disabled_indexes: set[int] = set()
-        self._all_tokens_disabled_logged = False
-
-    def close(self) -> None:
-        self._client.close()
-
-    def request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        attempts = self._token_attempts()
-        last_response: httpx.Response | None = None
-        for token_index, token in attempts:
-            response = self._client.request(
-                method,
-                url,
-                **self._request_kwargs_with_token(kwargs, token),
-            )
-            last_response = response
-            if response.status_code == 401 and token_index is not None:
-                self._disable_token(token_index)
-                continue
-            if token_index is not None and self._rotate:
-                self._mark_success(token_index)
-            return response
-        if last_response is None:
-            raise RuntimeError("GitHub client made no request")
-        return last_response
-
-    def get(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("GET", url, **kwargs)
-
-    def post(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("POST", url, **kwargs)
-
-    def put(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("PUT", url, **kwargs)
-
-    def patch(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("PATCH", url, **kwargs)
-
-    def delete(self, url: str, **kwargs) -> httpx.Response:
-        return self.request("DELETE", url, **kwargs)
-
-    def github_cache_namespace(self) -> str:
-        attempts = self._token_attempts()
-        token_index, token = attempts[0]
-        if token_index is None or not token:
-            return f"{self._user_agent}:unauthenticated"
-        return f"{self._user_agent}:token:{_token_fingerprint(token)}"
-
-    def _token_attempts(self) -> list[tuple[int | None, str | None]]:
-        with self._lock:
-            active_indexes = [idx for idx in range(len(self._tokens)) if idx not in self._disabled_indexes]
-            if not active_indexes:
-                if self._tokens and not self._all_tokens_disabled_logged:
-                    self._all_tokens_disabled_logged = True
-                    log.error(
-                        "GitHub client %s exhausted all configured auth tokens after HTTP 401 responses; "
-                        "falling back to unauthenticated requests",
-                        self._user_agent,
-                    )
-                return [(None, None)]
-            self._all_tokens_disabled_logged = False
-            if not self._rotate:
-                return [(idx, self._tokens[idx]) for idx in active_indexes]
-            attempts: list[tuple[int | None, str | None]] = []
-            for offset in range(len(self._tokens)):
-                idx = (self._next_index + offset) % len(self._tokens)
-                if idx in self._disabled_indexes:
-                    continue
-                attempts.append((idx, self._tokens[idx]))
-            return attempts
-
-    def _request_kwargs_with_token(self, kwargs: dict[str, Any], token: str | None) -> dict[str, Any]:
-        request_kwargs = dict(kwargs)
-        headers = dict(request_kwargs.get("headers") or {})
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        else:
-            headers.pop("Authorization", None)
-        request_kwargs["headers"] = headers
-        return request_kwargs
-
-    def _disable_token(self, token_index: int) -> None:
-        with self._lock:
-            if token_index in self._disabled_indexes:
-                return
-            self._disabled_indexes.add(token_index)
-            remaining = len(self._tokens) - len(self._disabled_indexes)
-            fingerprint = _token_fingerprint(self._tokens[token_index])
-        log.warning(
-            "GitHub client %s permanently blacklisted token #%d (%s) after HTTP 401; %d token(s) remain",
-            self._user_agent,
-            token_index + 1,
-            fingerprint,
-            remaining,
-        )
-
-    def _mark_success(self, token_index: int) -> None:
-        with self._lock:
-            self._next_index = (token_index + 1) % max(1, len(self._tokens))
 
 
 class RetryableDuelError(RuntimeError):
@@ -5688,7 +5549,7 @@ def _confirmed_transition_timestamp(
 # Chain + queue management (preserved from original)
 # ---------------------------------------------------------------------------
 
-def _build_github_client(config: RunConfig) -> _GitHubAuthRotatingClient:
+def _build_github_client(config: RunConfig) -> GitHubAuthRotatingClient:
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -5697,7 +5558,7 @@ def _build_github_client(config: RunConfig) -> _GitHubAuthRotatingClient:
     tokens = _split_github_tokens(config.github_tokens)
     if config.github_token:
         tokens.append(config.github_token)
-    return _GitHubAuthRotatingClient(
+    return GitHubAuthRotatingClient(
         base_headers=headers,
         timeout=config.http_timeout,
         tokens=tokens,
@@ -5706,7 +5567,7 @@ def _build_github_client(config: RunConfig) -> _GitHubAuthRotatingClient:
     )
 
 
-def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
+def _build_github_merge_client(config: RunConfig) -> GitHubAuthRotatingClient:
     # Owner-scoped client used for publishing promoted private submissions. Prefers github_merge_token
     # (typically GITHUB_TOKEN_UNARBOS) so we never accidentally use a rotation
     # token that lacks write access to the public base repo.
@@ -5718,7 +5579,7 @@ def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
     tokens: list[str] = []
     if config.github_merge_token:
         tokens.append(config.github_merge_token)
-    return _GitHubAuthRotatingClient(
+    return GitHubAuthRotatingClient(
         base_headers=headers,
         timeout=config.http_timeout,
         tokens=tokens,
