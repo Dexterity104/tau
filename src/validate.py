@@ -14,14 +14,12 @@ import textwrap
 import threading
 import time
 from collections.abc import Sequence
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
-from concurrent.futures import wait as _futures_wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError, wait as _futures_wait
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.parse import parse_qsl, quote
-from typing import Protocol, cast
 
 import httpx
 
@@ -4596,7 +4594,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             )
                         except Exception:
                             log.exception("Dashboard duel start publish failed (non-fatal)")
-                        
+
 
 
                         def _make_progress_callback(
@@ -5077,7 +5075,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 duel_result.duel_id,
                             )
                             break
-                        
+
 
 
                         if _should_refresh_chain_submissions(
