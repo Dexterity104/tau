@@ -1635,6 +1635,8 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertIn("Reorder-only / gate-order changes", call["system_prompt"])
         self.assertIn("hail-mary", call["system_prompt"])
         self.assertIn("real_edit_score", call["system_prompt"])
+        self.assertIn("Deletion is not itself a", call["system_prompt"])
+        self.assertIn("deletion is not a score boost", call["system_prompt"])
         self.assertIn("<submission_data>", call["prompt"])
         self.assertNotIn("<pr_data>", call["prompt"])
 
