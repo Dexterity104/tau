@@ -14,16 +14,11 @@ from typing import Any
 
 import httpx
 
+import tau.utils
+from tau.io.openrouter import normalize_base_url
 from tau.rollouts.schema import build_llm_event, utc_now
 
 log = logging.getLogger("swe-eval.openrouter_proxy")
-
-def _normalize_upstream_base_url(raw: str | None) -> str:
-    base = (raw or "https://openrouter.ai/api").rstrip("/")
-    if base.endswith("/v1"):
-        return base[: -len("/v1")]
-    return base
-
 
 _UPSTREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
 REQUEST_LIMIT_EXIT_REASON = "request_limit_exceeded"
@@ -67,7 +62,7 @@ _HOP_BY_HOP_HEADERS = {
 
 
 def _upstream_base_url() -> str:
-    return _normalize_upstream_base_url(
+    return normalize_base_url(
         os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
     )
 
@@ -193,10 +188,7 @@ class SolveUsageSummary:
             reasoning_tokens=self.reasoning_tokens,
             cost=self.cost,
             budget_exceeded_reason=self.budget_exceeded_reason,
-            requests=[
-                ProxyRequestRecord(**request.to_dict())
-                for request in self.requests
-            ],
+            requests=[ProxyRequestRecord(**request.to_dict()) for request in self.requests],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -227,7 +219,9 @@ class OpenRouterProxy:
     unix_socket_path: str | None = None
     enforced_model: str | None = None
     enforced_provider: dict[str, Any] | None = None
-    enforced_sampling_params: dict[str, Any] | None = field(default_factory=lambda: dict(_VALIDATOR_SAMPLING_PARAMS))
+    enforced_sampling_params: dict[str, Any] | None = field(
+        default_factory=lambda: dict(_VALIDATOR_SAMPLING_PARAMS)
+    )
     require_auth: bool = True
     auth_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
     rollout_event_sink: Callable[[dict[str, Any]], None] | None = None
@@ -300,7 +294,9 @@ class OpenRouterProxy:
             # Make socket world-writable so Docker containers (which drop
             # CAP_DAC_OVERRIDE) can connect from any UID.
             os.chmod(self.unix_socket_path, 0o777)
-            self._unix_thread = threading.Thread(target=self._unix_server.serve_forever, daemon=True)
+            self._unix_thread = threading.Thread(
+                target=self._unix_server.serve_forever, daemon=True
+            )
             self._unix_thread.start()
             log.debug("OpenRouter proxy listening on unix socket %s", self.unix_socket_path)
 
@@ -460,7 +456,9 @@ class OpenRouterProxy:
             )
             return
         request_model = _extract_request_model(request_payload)
-        if (not request_model and not self.enforced_model) or not _request_payload_has_messages(request_payload):
+        if (not request_model and not self.enforced_model) or not _request_payload_has_messages(
+            request_payload
+        ):
             self._reject_request(
                 handler,
                 reason=PROXY_ERROR_EXIT_REASON,
@@ -472,7 +470,9 @@ class OpenRouterProxy:
                 request_model=request_model,
             )
             return
-        body, rejection_reason = self._prepare_request_body(body=body, request_payload=request_payload)
+        body, rejection_reason = self._prepare_request_body(
+            body=body, request_payload=request_payload
+        )
         if rejection_reason:
             self._reject_request(
                 handler,
@@ -496,14 +496,18 @@ class OpenRouterProxy:
         try:
             with httpx.Client(timeout=_UPSTREAM_TIMEOUT) as client:
                 if _should_stream_chat_completion(handler.command, request_path, prepared_payload):
-                    response_body, response_payload, response_status, response_headers, first_token_latency_ms = (
-                        self._request_streamed_chat_completion(
-                            client=client,
-                            upstream_url=upstream_url,
-                            upstream_headers=upstream_headers,
-                            request_payload=prepared_payload,
-                            start=start,
-                        )
+                    (
+                        response_body,
+                        response_payload,
+                        response_status,
+                        response_headers,
+                        first_token_latency_ms,
+                    ) = self._request_streamed_chat_completion(
+                        client=client,
+                        upstream_url=upstream_url,
+                        upstream_headers=upstream_headers,
+                        request_payload=prepared_payload,
+                        start=start,
                     )
                 else:
                     response = client.request(
@@ -533,7 +537,9 @@ class OpenRouterProxy:
                 method=handler.command,
                 path=handler.path,
                 request_payload=prepared_payload if self.rollout_capture_bodies else None,
-                response_payload={"error": {"message": str(exc), "type": "upstream_transport_error"}},
+                response_payload={
+                    "error": {"message": str(exc), "type": "upstream_transport_error"}
+                },
                 request_record=request_record,
                 started_at=started_at,
                 finished_at=finished_at,
@@ -604,7 +610,9 @@ class OpenRouterProxy:
             "cache_write_tokens": request_record.cache_write_tokens,
             "reasoning_tokens": request_record.reasoning_tokens,
         }
-        secrets_tuple = tuple(value for value in (self.openrouter_api_key, self.auth_token) if value)
+        secrets_tuple = tuple(
+            value for value in (self.openrouter_api_key, self.auth_token) if value
+        )
         event = build_llm_event(
             method=method,
             path=path,
@@ -698,8 +706,8 @@ class OpenRouterProxy:
                 for choice in chunk.get("choices") or []:
                     if not isinstance(choice, dict):
                         continue
-                    delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
-                    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+                    delta = tau.utils.get_dict(choice, "delta")
+                    message = tau.utils.get_dict(choice, "message")
                     if delta.get("role"):
                         role = str(delta["role"])
                     elif message.get("role"):
@@ -726,7 +734,9 @@ class OpenRouterProxy:
                         self._record_first_token()
 
                     finish_reason = choice.get("finish_reason") or finish_reason
-                    native_finish_reason = choice.get("native_finish_reason") or native_finish_reason
+                    native_finish_reason = (
+                        choice.get("native_finish_reason") or native_finish_reason
+                    )
 
         payload: dict[str, Any] = {
             "id": response_id or f"chatcmpl-proxy-{int(time.time() * 1000)}",
@@ -750,7 +760,13 @@ class OpenRouterProxy:
         if reasoning_parts:
             payload["choices"][0]["message"]["reasoning"] = "".join(reasoning_parts)
         response_body = json.dumps(payload).encode("utf-8")
-        return response_body, payload, 200, httpx.Headers({"Content-Type": "application/json"}), first_token_latency_ms
+        return (
+            response_body,
+            payload,
+            200,
+            httpx.Headers({"Content-Type": "application/json"}),
+            first_token_latency_ms,
+        )
 
     def _prepare_request_body(
         self,
@@ -819,13 +835,22 @@ class OpenRouterProxy:
             return
         if not self.solve_budget:
             return
-        if self.solve_budget.max_cost is not None and self._usage.cost >= self.solve_budget.max_cost:
+        if (
+            self.solve_budget.max_cost is not None
+            and self._usage.cost >= self.solve_budget.max_cost
+        ):
             self._usage.budget_exceeded_reason = COST_LIMIT_EXIT_REASON
             return
-        if self.solve_budget.max_total_tokens is not None and self._usage.total_tokens >= self.solve_budget.max_total_tokens:
+        if (
+            self.solve_budget.max_total_tokens is not None
+            and self._usage.total_tokens >= self.solve_budget.max_total_tokens
+        ):
             self._usage.budget_exceeded_reason = TOKEN_LIMIT_EXIT_REASON
             return
-        if self.solve_budget.max_prompt_tokens is not None and self._usage.prompt_tokens >= self.solve_budget.max_prompt_tokens:
+        if (
+            self.solve_budget.max_prompt_tokens is not None
+            and self._usage.prompt_tokens >= self.solve_budget.max_prompt_tokens
+        ):
             self._usage.budget_exceeded_reason = TOKEN_LIMIT_EXIT_REASON
             return
         if (
@@ -837,7 +862,10 @@ class OpenRouterProxy:
     def _check_request_limit_locked(self) -> None:
         if self._usage.budget_exceeded_reason or not self.solve_budget:
             return
-        if self.solve_budget.max_requests is not None and self._usage.request_count >= self.solve_budget.max_requests:
+        if (
+            self.solve_budget.max_requests is not None
+            and self._usage.request_count >= self.solve_budget.max_requests
+        ):
             self._usage.budget_exceeded_reason = REQUEST_LIMIT_EXIT_REASON
 
     def _check_estimated_request_budget_locked(
@@ -850,14 +878,18 @@ class OpenRouterProxy:
             return
         remaining_prompt_tokens = None
         if self.solve_budget.max_prompt_tokens is not None:
-            remaining_prompt_tokens = max(0, self.solve_budget.max_prompt_tokens - self._usage.prompt_tokens)
+            remaining_prompt_tokens = max(
+                0, self.solve_budget.max_prompt_tokens - self._usage.prompt_tokens
+            )
             if estimated_prompt_tokens > remaining_prompt_tokens:
                 self._usage.budget_exceeded_reason = TOKEN_LIMIT_EXIT_REASON
                 return
 
         remaining_total_tokens = None
         if self.solve_budget.max_total_tokens is not None:
-            remaining_total_tokens = max(0, self.solve_budget.max_total_tokens - self._usage.total_tokens)
+            remaining_total_tokens = max(
+                0, self.solve_budget.max_total_tokens - self._usage.total_tokens
+            )
             if estimated_prompt_tokens >= remaining_total_tokens:
                 self._usage.budget_exceeded_reason = TOKEN_LIMIT_EXIT_REASON
                 return
@@ -885,18 +917,28 @@ class OpenRouterProxy:
         if self.solve_budget.max_tokens_per_request is not None:
             limits.append(self.solve_budget.max_tokens_per_request)
         if self.solve_budget.max_completion_tokens is not None:
-            limits.append(max(0, self.solve_budget.max_completion_tokens - self._usage.completion_tokens))
+            limits.append(
+                max(0, self.solve_budget.max_completion_tokens - self._usage.completion_tokens)
+            )
         if self.solve_budget.max_total_tokens is not None:
-            remaining_total_tokens = max(0, self.solve_budget.max_total_tokens - self._usage.total_tokens)
+            remaining_total_tokens = max(
+                0, self.solve_budget.max_total_tokens - self._usage.total_tokens
+            )
             limits.append(max(0, remaining_total_tokens - estimated_prompt_tokens))
         average_cost_per_token = self._average_cost_per_token_locked()
-        if self.solve_budget.max_cost is not None and average_cost_per_token is not None and average_cost_per_token > 0:
+        if (
+            self.solve_budget.max_cost is not None
+            and average_cost_per_token is not None
+            and average_cost_per_token > 0
+        ):
             remaining_cost = max(0.0, self.solve_budget.max_cost - self._usage.cost)
             estimated_prompt_cost = estimated_prompt_tokens * average_cost_per_token
             if estimated_prompt_cost >= remaining_cost:
                 self._usage.budget_exceeded_reason = COST_LIMIT_EXIT_REASON
                 return
-            estimated_affordable_output_tokens = int((remaining_cost - estimated_prompt_cost) / average_cost_per_token)
+            estimated_affordable_output_tokens = int(
+                (remaining_cost - estimated_prompt_cost) / average_cost_per_token
+            )
             limits.append(max(0, estimated_affordable_output_tokens))
         if not limits:
             return
@@ -958,7 +1000,11 @@ class OpenRouterProxy:
     def _record_request(self, request: ProxyRequestRecord) -> None:
         with self._lock:
             self._usage.requests.append(request)
-            if request.status_code is not None and request.status_code < 400 and request.error is None:
+            if (
+                request.status_code is not None
+                and request.status_code < 400
+                and request.error is None
+            ):
                 self._usage.success_count += 1
             else:
                 self._usage.error_count += 1
