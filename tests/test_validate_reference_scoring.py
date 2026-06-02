@@ -92,6 +92,7 @@ class ReferenceScoringTest(unittest.TestCase):
             patch("validate.compare_task_run", side_effect=fake_compare_task_run),
             patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate.publish_round_data"),
+            patch("validate._build_agent_config", side_effect=lambda config, sub: config),
         ):
             result = _solve_and_compare_round(
                 task=task,
@@ -379,6 +380,7 @@ class ReferenceScoringTest(unittest.TestCase):
             patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate._judge_round_diffs", return_value=judge),
             patch("validate.publish_round_data"),
+            patch("validate._build_agent_config", side_effect=lambda config, sub: config),
         ):
             return _solve_and_compare_round(
                 task=task,
