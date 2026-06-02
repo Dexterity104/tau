@@ -56,6 +56,8 @@ from workspace import (
     write_json,
 )
 
+from tau.io.github import GitHubClient
+
 log = logging.getLogger("swe-eval.validate")
 _DEFAULT_GITHUB_AGENT_FILE = "agent.py"
 _MINER_AGENT_REPO_FULL_NAME = "unarbos/ninja"
@@ -210,7 +212,7 @@ def _github_cache_namespace(client: httpx.Client) -> str:
     return f"client:{_client_cache_nonce(client)}"
 
 
-class _GitHubAuthRotatingClient:
+class _GitHubAuthRotatingClient(GitHubClient):
     """Small GitHub client wrapper with token rotation and 401 blacklisting."""
 
     def __init__(
@@ -5726,7 +5728,7 @@ def _build_github_merge_client(config: RunConfig) -> _GitHubAuthRotatingClient:
 
 
 def _fetch_branch_head_sha(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     branch: str,
@@ -5765,8 +5767,8 @@ def _fetch_branch_head_sha(
 def _resolve_merged_promotion_candidate(
     *,
     subtensor,
-    github_client: httpx.Client,
-    github_merge_client: httpx.Client,
+    github_client: GitHubClient,
+    github_merge_client: GitHubClient,
     config: RunConfig,
     state: ValidatorState,
     primary_candidate: ValidatorSubmission,
@@ -5792,7 +5794,7 @@ def _resolve_merged_promotion_candidate(
 
 def _publish_promoted_private_submission(
     *,
-    github_client: httpx.Client,
+    github_client: GitHubClient,
     config: RunConfig,
     submission: ValidatorSubmission,
 ) -> ValidatorSubmission:
@@ -5918,7 +5920,7 @@ def _has_unresolved_conflict_markers(text: str) -> bool:
 
 
 def _create_github_branch_ref(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     branch: str,
@@ -5929,7 +5931,7 @@ def _create_github_branch_ref(
 
 
 def _create_github_branch_ref_detailed(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     branch: str,
@@ -5960,7 +5962,7 @@ def _create_github_branch_ref_detailed(
 
 
 def _merge_github_branch_into_base(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     base_ref: str,
@@ -5978,7 +5980,7 @@ def _merge_github_branch_into_base(
 
 
 def _merge_github_branch_into_base_detailed(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     base_ref: str,
@@ -6027,7 +6029,7 @@ def _merge_github_branch_into_base_detailed(
 
 
 def _delete_github_branch_ref(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     branch: str,
@@ -6048,7 +6050,7 @@ def _delete_github_branch_ref(
 
 
 def _fetch_github_text_file(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     path: str,
@@ -6085,7 +6087,7 @@ def _fetch_github_text_file(
 
 
 def _update_github_text_file(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     path: str,
@@ -6107,7 +6109,7 @@ def _update_github_text_file(
 
 
 def _update_github_text_file_detailed(
-    client: httpx.Client,
+    client: GitHubClient,
     *,
     repo: str,
     path: str,
@@ -6592,7 +6594,7 @@ def _normalize_revealed_commitment_entries(entries: Any) -> list[tuple[int, str]
     return normalized
 
 
-def _fetch_chain_submissions(*, subtensor, github_client: httpx.Client, config: RunConfig, state: ValidatorState | None = None) -> list[ValidatorSubmission]:
+def _fetch_chain_submissions(*, subtensor, github_client: GitHubClient, config: RunConfig, state: ValidatorState | None = None) -> list[ValidatorSubmission]:
     revealed = subtensor.commitments.get_all_revealed_commitments(config.validate_netuid)
     current_commitments = subtensor.commitments.get_all_commitments(config.validate_netuid)
     if not isinstance(revealed, dict):
@@ -6904,12 +6906,12 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
     )
 
 
-def _ensure_king(*, state: ValidatorState, github_client: httpx.Client, config: RunConfig) -> None:
+def _ensure_king(*, state: ValidatorState, github_client: GitHubClient, config: RunConfig) -> None:
     if state.current_king:
         return
 
 
-def _build_burn_king(*, github_client: httpx.Client, config: RunConfig) -> ValidatorSubmission:
+def _build_burn_king(*, github_client: GitHubClient, config: RunConfig) -> ValidatorSubmission:
     base_repo = (config.validate_publish_repo or _MINER_AGENT_REPO_FULL_NAME).strip() or _MINER_AGENT_REPO_FULL_NAME
     base_ref = (config.validate_publish_base or _MINER_AGENT_BRANCH).strip() or _MINER_AGENT_BRANCH
     commit_sha = _fetch_branch_head_sha(github_client, repo=base_repo, branch=base_ref) or ""
@@ -7081,7 +7083,7 @@ def _maybe_disqualify_king(*, subtensor, github_client, config, state) -> None:
 
 def _backfill_recent_king_display_metadata(
     *,
-    github_client: httpx.Client,
+    github_client: GitHubClient,
     config: RunConfig,
     state: ValidatorState,
 ) -> bool:
@@ -7948,7 +7950,7 @@ class _TransientCommitCheckError(Exception):
     almost certainly still valid; we just couldn't verify right now."""
 
 
-def _resolve_public_commit(client: httpx.Client, repo: str, sha: str) -> str | None:
+def _resolve_public_commit(client: GitHubClient, repo: str, sha: str) -> str | None:
     """Returns the full commit sha if the repo+commit is verifiably public,
     or None if it is verifiably NOT public (404 / private). Raises
     _TransientCommitCheckError for any other failure (network, 5xx, 403
@@ -7990,7 +7992,7 @@ def _resolve_public_commit(client: httpx.Client, repo: str, sha: str) -> str | N
     return full_sha
 
 
-def _is_public_commit(client: httpx.Client, repo: str, sha: str) -> bool:
+def _is_public_commit(client: GitHubClient, repo: str, sha: str) -> bool:
     """Returns True if verifiably public, False if verifiably not. On
     transient errors, returns True (fail-open) so we don't disqualify
     miners due to GitHub flakiness. The transient-aware variant
@@ -8002,7 +8004,7 @@ def _is_public_commit(client: httpx.Client, repo: str, sha: str) -> bool:
         return True
 
 
-def _is_commit_on_branch(client: httpx.Client, repo: str, sha: str, branch: str) -> bool:
+def _is_commit_on_branch(client: GitHubClient, repo: str, sha: str, branch: str) -> bool:
     try:
         r = client.get(f"/repos/{repo}/compare/{sha}...{branch}")
     except (httpx.HTTPError, OSError) as exc:
