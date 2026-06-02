@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import ast
 import base64
-import json
 import hashlib
+import json
 import logging
 import os
 import re
@@ -13,15 +13,15 @@ import subprocess
 import textwrap
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError, wait as _futures_wait
+from collections.abc import Sequence
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as _futures_wait
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Protocol, cast
 from urllib.parse import parse_qsl, quote
-from typing import Protocol, cast
 
-import bittensor as bt
 import httpx
 
 from config import RunConfig, SolverAgentSource
@@ -32,19 +32,21 @@ from private_submission import (
     accepted_private_submission_entries,
     private_submission_check_passed,
 )
-from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
-from tau.rollouts.store import update_rollout
 from r2 import (
-    duel_to_summary,
-    fetch_chain_data,
     build_dashboard_home_payload,
     build_dashboard_summary_payload,
+    duel_to_summary,
+    fetch_chain_data,
     publish_dashboard_data,
     publish_duel_data,
     publish_duel_index,
     publish_round_data,
     publish_training_data,
 )
+from solver_runner import PROVIDER_ACCOUNT_ERROR_EXIT_REASON, PROVIDER_ENDPOINT_ERROR_EXIT_REASON
+from tau import bittensor as bt
+from tau.io.github import GitHubAuthRotatingClient, GitHubClient
+from tau.rollouts.store import update_rollout
 from workspace import (
     build_compare_paths,
     build_solution_paths,
@@ -55,8 +57,6 @@ from workspace import (
     resolve_task_paths,
     write_json,
 )
-
-from tau.io.github import GitHubClient, GitHubAuthRotatingClient
 
 log = logging.getLogger("swe-eval.validate")
 _DEFAULT_GITHUB_AGENT_FILE = "agent.py"
@@ -233,7 +233,7 @@ def _duel_speed_stop_reason(wins: int, losses: int, remaining_rounds: int, margi
 
 
 def _copy_detection_reason(
-    rounds: Sequence["ValidationRoundResult"],
+    rounds: Sequence[ValidationRoundResult],
     *,
     include_mean_similarity: bool = True,
     include_suspicious_fraction: bool = True,
@@ -296,13 +296,13 @@ def _effective_pool_task_agent_timeout(*, cursor_elapsed: float, stored_timeout:
     return max(int(stored_timeout), policy_timeout)
 
 
-def _duel_agent_timeout(task: "PoolTask") -> int:
+def _duel_agent_timeout(task: PoolTask) -> int:
     if task.agent_timeout_seconds > 0:
         return task.agent_timeout_seconds
     return _POOL_SOLVE_TIMEOUT_SECONDS
 
 
-def _order_duel_tasks_for_submission(tasks: list["PoolTask"]) -> list["PoolTask"]:
+def _order_duel_tasks_for_submission(tasks: list[PoolTask]) -> list[PoolTask]:
     """Preserve gathered order so every challenger sees the same task sequence."""
     return list(tasks)
 
@@ -312,9 +312,9 @@ def _order_duel_tasks_for_submission(tasks: list["PoolTask"]) -> list["PoolTask"
 # ---------------------------------------------------------------------------
 
 def _notify_new_king(
-    new_king: "ValidatorSubmission",
-    old_king: "ValidatorSubmission | None",
-    duel_result: "DuelResult",
+    new_king: ValidatorSubmission,
+    old_king: ValidatorSubmission | None,
+    duel_result: DuelResult,
 ) -> None:
     """Post a gold embed to Discord when a new king is crowned."""
     token = os.environ.get("DISCORD_BOT_TOKEN")
@@ -4468,7 +4468,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                             )
                         except Exception:
                             log.exception("Dashboard duel start publish failed (non-fatal)")
-                        
+
 
                         def _make_progress_callback(
                             chall_hk: str,
@@ -4948,7 +4948,7 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 duel_result.duel_id,
                             )
                             break
-                        
+
 
                         if _should_refresh_chain_submissions(
                             force=False,
@@ -7240,7 +7240,7 @@ def _materialize_agent_cache(config: RunConfig, sub: ValidatorSubmission) -> Pat
 def _agent_cache_key(sub: ValidatorSubmission) -> str:
     repo = sub.repo_full_name.replace("/", "--")
     digest = hashlib.sha256(
-        f"{sub.repo_url}\0{sub.commit_sha}\0{_DEFAULT_GITHUB_AGENT_FILE}".encode("utf-8"),
+        f"{sub.repo_url}\0{sub.commit_sha}\0{_DEFAULT_GITHUB_AGENT_FILE}".encode(),
     ).hexdigest()[:16]
     return f"{repo}--{sub.commit_sha[:12]}--{digest}"
 
@@ -7657,7 +7657,7 @@ def _split_submission_identity_proof(raw: str) -> tuple[str, dict[str, str]]:
 
 
 def _submission_username_message(username: str) -> bytes:
-    return f"{_AGENT_USERNAME_PROOF_MESSAGE_PREFIX}{username}".encode("utf-8")
+    return f"{_AGENT_USERNAME_PROOF_MESSAGE_PREFIX}{username}".encode()
 
 
 def _verified_submission_identity_from_config(
