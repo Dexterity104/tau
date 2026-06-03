@@ -33,6 +33,7 @@ _TASK_ARCHIVE_LOCK = threading.Lock()
 _TASK_ARCHIVE_UPLOAD_LOCK = threading.Lock()
 _SAVED_TASK_FILL_LOCK = threading.Lock()
 _SAVED_TASK_FILL_IN_FLIGHT: set[str] = set()
+_SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS: dict[str, str] = {}
 _POOL_FILL_ADD_LOCK = threading.Lock()
 _POOL_FILLER_WORKER_OVERSUBSCRIBE = 1
 _ARCHIVE_UPLOAD_COMPLETE_STATUSES = {"uploaded_delete_pending", "uploaded_deleted"}
@@ -144,6 +145,21 @@ def _task_root_fingerprints(task_roots: Iterable[Path]) -> set[str]:
 
 def _pool_task_roots(pool: v.TaskPool) -> list[Path]:
     return [Path(task.task_root) for task in pool.list_tasks()]
+
+
+def _pool_task_roots_from_disk(config: RunConfig) -> list[Path]:
+    roots: list[Path] = []
+    for path in config.validate_root.glob("task-pool*/*.json"):
+        try:
+            payload = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        task_root = payload.get("task_root")
+        if isinstance(task_root, str) and task_root:
+            roots.append(Path(task_root))
+    return roots
 
 
 def archived_task_fingerprints(config: RunConfig) -> set[str]:
@@ -954,20 +970,21 @@ def claim_saved_task_for_pool(
         )
         existing_fingerprints = (
             _task_root_fingerprints(_pool_task_roots(pool))
-            | _task_root_fingerprints(config.tasks_root / name for name in pool_task_names_from_disk(config.validate_root))
+            | _task_root_fingerprints(_pool_task_roots_from_disk(config))
             | _task_root_fingerprints(config.tasks_root / name for name in (extra_exclude or set()))
+            | set(_SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS.values())
             | archived_task_fingerprints(config)
         )
-        candidates = [
-            task_dir
-            for task_dir in sorted(config.tasks_root.glob("validate-*"), key=lambda p: p.name)
+        candidates: list[tuple[Path, str | None]] = []
+        for task_dir in sorted(config.tasks_root.glob("validate-*"), key=lambda p: p.name):
+            fingerprint = task_content_fingerprint(task_dir)
             if (
                 saved_task_can_fill_pool(task_dir)
                 and task_dir.name not in existing
                 and task_dir.name not in _SAVED_TASK_FILL_IN_FLIGHT
-                and task_content_fingerprint(task_dir) not in existing_fingerprints
-            )
-        ]
+                and fingerprint not in existing_fingerprints
+            ):
+                candidates.append((task_dir, fingerprint))
         if not candidates:
             return None
         cursor_path = _saved_task_fill_cursor_path(config, pool_label)
@@ -978,9 +995,11 @@ def claim_saved_task_for_pool(
                 last_name = str(payload.get("last_task_name") or "")
         except Exception:
             pass
-        start = next((idx for idx, candidate in enumerate(candidates) if candidate.name > last_name), 0)
-        chosen = candidates[start]
+        start = next((idx for idx, candidate in enumerate(candidates) if candidate[0].name > last_name), 0)
+        chosen, chosen_fingerprint = candidates[start]
         _SAVED_TASK_FILL_IN_FLIGHT.add(chosen.name)
+        if chosen_fingerprint:
+            _SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS[chosen.name] = chosen_fingerprint
         try:
             cursor_path.parent.mkdir(parents=True, exist_ok=True)
             write_json(cursor_path, {"last_task_name": chosen.name, "updated_at": v._timestamp()})
@@ -994,6 +1013,7 @@ def release_saved_task_claim(task_name: str | None) -> None:
         return
     with _SAVED_TASK_FILL_LOCK:
         _SAVED_TASK_FILL_IN_FLIGHT.discard(task_name)
+        _SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS.pop(task_name, None)
 
 
 def pool_filler_worker_count(config: RunConfig) -> int:
@@ -1221,8 +1241,10 @@ def _prepare_one_task_for_pool(
             candidate_fingerprint = task_content_fingerprint(Path(candidate.task_root))
             existing_fingerprints = (
                 _task_root_fingerprints(_pool_task_roots(pool))
+                | _task_root_fingerprints(_pool_task_roots_from_disk(config))
                 | _task_root_fingerprints(config.tasks_root / name for name in leased_task_names)
                 | _task_root_fingerprints(config.tasks_root / name for name in pending_archive_names)
+                | set(_SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS.values())
                 | archived_task_fingerprints(config)
             )
             if candidate_fingerprint and candidate_fingerprint in existing_fingerprints:

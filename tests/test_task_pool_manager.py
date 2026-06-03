@@ -105,6 +105,7 @@ class TaskPoolManagerTest(unittest.TestCase):
     def tearDown(self):
         with manager._SAVED_TASK_FILL_LOCK:
             manager._SAVED_TASK_FILL_IN_FLIGHT.clear()
+            manager._SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS.clear()
 
     def test_pool_filler_worker_count_matches_solve_slots(self):
         config = RunConfig(validate_pool_filler_concurrency=25)
@@ -453,6 +454,56 @@ class TaskPoolManagerTest(unittest.TestCase):
                 self.assertEqual(claimed.name, third.name)
             finally:
                 manager.release_saved_task_claim(claimed.name if claimed else None)
+
+    def test_claim_saved_task_for_pool_skips_duplicate_content_in_sibling_pool(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            primary_pool = TaskPool(config.validate_root / "task-pool")
+            retest_pool = TaskPool(config.validate_root / "task-pool-retest")
+            first = self._saved_task(config, "validate-20260101000000-000001", commit_sha="same")
+            self._saved_task(config, "validate-20260101000000-000002", commit_sha="same")
+            third = self._saved_task(config, "validate-20260101000000-000003", commit_sha="different")
+            primary_pool.add(
+                PoolTask(
+                    task_name=first.name,
+                    task_root=str(first),
+                    creation_block=1,
+                    cursor_elapsed=1.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                )
+            )
+
+            claimed = manager.claim_saved_task_for_pool(config, retest_pool, "retest")
+            try:
+                self.assertIsNotNone(claimed)
+                assert claimed is not None
+                self.assertEqual(claimed.name, third.name)
+            finally:
+                manager.release_saved_task_claim(claimed.name if claimed else None)
+
+    def test_claim_saved_task_for_pool_skips_in_flight_duplicate_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            primary_pool = TaskPool(config.validate_root / "task-pool")
+            retest_pool = TaskPool(config.validate_root / "task-pool-retest")
+            self._saved_task(config, "validate-20260101000000-000001", commit_sha="same")
+            self._saved_task(config, "validate-20260101000000-000002", commit_sha="same")
+            third = self._saved_task(config, "validate-20260101000000-000003", commit_sha="different")
+
+            first = manager.claim_saved_task_for_pool(config, primary_pool, "primary")
+            second = manager.claim_saved_task_for_pool(config, retest_pool, "retest")
+            try:
+                self.assertIsNotNone(first)
+                self.assertIsNotNone(second)
+                assert second is not None
+                self.assertEqual(second.name, third.name)
+            finally:
+                manager.release_saved_task_claim(first.name if first else None)
+                manager.release_saved_task_claim(second.name if second else None)
 
     def test_archive_ledger_records_content_fingerprint(self):
         with tempfile.TemporaryDirectory() as td:
