@@ -14,13 +14,30 @@ from validate import ActiveDuelLease, PoolTask, TaskPool, ValidatorState, Valida
 
 
 class TaskPoolManagerTest(unittest.TestCase):
-    def _task(self, config: RunConfig, name: str = "validate-20260101000000-000001") -> PoolTask:
+    def _task(
+        self,
+        config: RunConfig,
+        name: str = "validate-20260101000000-000001",
+        commit_sha: str = "abc",
+        reference_patch: str = "diff\n",
+    ) -> PoolTask:
         task_root = config.tasks_root / name
         task_dir = task_root / "task"
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "task.json").write_text(json.dumps({"issue": "fix"}) + "\n")
-        (task_dir / "commit.json").write_text(json.dumps({"sha": "abc"}) + "\n")
+        (task_dir / "commit.json").write_text(
+            json.dumps(
+                {
+                    "repo_full_name": "owner/repo",
+                    "commit_sha": commit_sha,
+                    "sha": commit_sha,
+                    "parent_sha": "parent",
+                }
+            )
+            + "\n"
+        )
         (task_dir / "task.txt").write_text("hello\n")
+        (task_dir / "reference.patch").write_text(reference_patch)
         return PoolTask(
             task_name=name,
             task_root=str(task_root),
@@ -42,12 +59,31 @@ class TaskPoolManagerTest(unittest.TestCase):
             commitment_block=1,
         )
 
-    def _saved_task(self, config: RunConfig, name: str, baseline_exit: str = "completed") -> Path:
+    def _saved_task(
+        self,
+        config: RunConfig,
+        name: str,
+        baseline_exit: str = "completed",
+        commit_sha: str = "abc",
+        reference_patch: str = "diff\n",
+    ) -> Path:
         task_root = config.tasks_root / name
         task_dir = task_root / "task"
         task_dir.mkdir(parents=True, exist_ok=True)
-        for artifact in ("task.json", "task.txt", "commit.json", "reference.patch"):
-            (task_dir / artifact).write_text("{}\n")
+        (task_dir / "task.json").write_text("{}\n")
+        (task_dir / "task.txt").write_text("task\n")
+        (task_dir / "commit.json").write_text(
+            json.dumps(
+                {
+                    "repo_full_name": "owner/repo",
+                    "commit_sha": commit_sha,
+                    "sha": commit_sha,
+                    "parent_sha": "parent",
+                }
+            )
+            + "\n"
+        )
+        (task_dir / "reference.patch").write_text(reference_patch)
         (task_dir / "original").mkdir(exist_ok=True)
         (task_dir / "reference").mkdir(exist_ok=True)
         baseline_dir = task_root / "solutions" / "baseline"
@@ -337,8 +373,8 @@ class TaskPoolManagerTest(unittest.TestCase):
             root = Path(td)
             config = RunConfig(workspace_root=root)
             pool = TaskPool(root / "pool")
-            for name in ("validate-20260101000000-000001", "validate-20260101000000-000002"):
-                self._saved_task(config, name)
+            for idx, name in enumerate(("validate-20260101000000-000001", "validate-20260101000000-000002"), start=1):
+                self._saved_task(config, name, commit_sha=f"commit-{idx}")
             manager.record_task_archive_status(
                 config=config,
                 task_name="validate-20260101000000-000001",
@@ -360,8 +396,8 @@ class TaskPoolManagerTest(unittest.TestCase):
             root = Path(td)
             config = RunConfig(workspace_root=root)
             pool = TaskPool(root / "pool")
-            for name in ("validate-20260101000000-000001", "validate-20260101000000-000002"):
-                self._saved_task(config, name)
+            for idx, name in enumerate(("validate-20260101000000-000001", "validate-20260101000000-000002"), start=1):
+                self._saved_task(config, name, commit_sha=f"commit-{idx}")
 
             first = manager.claim_saved_task_for_pool(config, pool, "primary")
             try:
@@ -389,6 +425,52 @@ class TaskPoolManagerTest(unittest.TestCase):
                 self.assertEqual(second.name, "validate-20260101000000-000002")
             finally:
                 manager.release_saved_task_claim(second.name if second else None)
+
+    def test_claim_saved_task_for_pool_skips_duplicate_content_in_pool(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config = RunConfig(workspace_root=root)
+            pool = TaskPool(root / "pool")
+            first = self._saved_task(config, "validate-20260101000000-000001", commit_sha="same")
+            self._saved_task(config, "validate-20260101000000-000002", commit_sha="same")
+            third = self._saved_task(config, "validate-20260101000000-000003", commit_sha="different")
+            pool.add(
+                PoolTask(
+                    task_name=first.name,
+                    task_root=str(first),
+                    creation_block=1,
+                    cursor_elapsed=1.0,
+                    king_lines=1,
+                    king_similarity=0.1,
+                    baseline_lines=1,
+                )
+            )
+
+            claimed = manager.claim_saved_task_for_pool(config, pool, "primary")
+            try:
+                self.assertIsNotNone(claimed)
+                assert claimed is not None
+                self.assertEqual(claimed.name, third.name)
+            finally:
+                manager.release_saved_task_claim(claimed.name if claimed else None)
+
+    def test_archive_ledger_records_content_fingerprint(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = RunConfig(workspace_root=Path(td))
+            pool = TaskPool(Path(td) / "pool")
+            task = self._task(config, commit_sha="archived")
+            fingerprint = manager.task_content_fingerprint(Path(task.task_root))
+
+            manager.record_task_archive_status(
+                config=config,
+                task_name=task.task_name,
+                pool_label="primary",
+                status="pool_inserted",
+                archive_hour_value="2026-05-22-01",
+                content_fingerprint=fingerprint,
+            )
+
+            self.assertEqual(manager.archived_task_fingerprints(config), {fingerprint})
 
     def test_claim_saved_task_for_pool_skips_partial_tasks(self):
         with tempfile.TemporaryDirectory() as td:
@@ -454,7 +536,15 @@ class TaskPoolManagerTest(unittest.TestCase):
             self.assertEqual(artifacts["task/binary.bin"]["encoding"], "base64")
             self.assertEqual(artifacts["task/binary.bin"]["content_base64"], "/wA=")
             self.assertEqual(row["task_metadata"], {"issue": "fix"})
-            self.assertEqual(row["commit_metadata"], {"sha": "abc"})
+            self.assertEqual(
+                row["commit_metadata"],
+                {
+                    "repo_full_name": "owner/repo",
+                    "commit_sha": "abc",
+                    "sha": "abc",
+                    "parent_sha": "parent",
+                },
+            )
 
     def test_archive_upload_success_removes_pool_and_local_task(self):
         with tempfile.TemporaryDirectory() as td:

@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from config import RunConfig
 from pipeline import compare_task_run, generate_task_run, solve_task_run
@@ -108,6 +108,51 @@ def write_task_archive_ledger(path: Path, ledger: dict[str, Any]) -> None:
 
 def archived_task_names(config: RunConfig) -> set[str]:
     return set(load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks") or {})
+
+
+def task_content_fingerprint(task_root: Path) -> str | None:
+    """Return a stable identity for the mined task content, independent of task name."""
+    commit = _read_json_file(task_root / "task" / "commit.json")
+    if not isinstance(commit, dict):
+        return None
+    repo = str(commit.get("repo_full_name") or "").strip().lower()
+    commit_sha = str(commit.get("commit_sha") or commit.get("sha") or "").strip().lower()
+    parent_sha = str(commit.get("parent_sha") or "").strip().lower()
+    patch_path = task_root / "task" / "reference.patch"
+    try:
+        patch_sha = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+    except Exception:
+        patch_sha = ""
+    if not any((repo, commit_sha, parent_sha, patch_sha)):
+        return None
+    payload = {
+        "commit_sha": commit_sha,
+        "parent_sha": parent_sha,
+        "patch_sha256": patch_sha,
+        "repo_full_name": repo,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _task_root_fingerprints(task_roots: Iterable[Path]) -> set[str]:
+    return {
+        fingerprint
+        for fingerprint in (task_content_fingerprint(task_root) for task_root in task_roots)
+        if fingerprint
+    }
+
+
+def _pool_task_roots(pool: v.TaskPool) -> list[Path]:
+    return [Path(task.task_root) for task in pool.list_tasks()]
+
+
+def archived_task_fingerprints(config: RunConfig) -> set[str]:
+    tasks = load_task_archive_ledger(task_archive_ledger_path(config)).get("tasks") or {}
+    return {
+        str(entry.get("content_fingerprint"))
+        for entry in tasks.values()
+        if isinstance(entry, dict) and entry.get("content_fingerprint")
+    }
 
 
 def removable_archived_pool_names(config: RunConfig) -> set[str]:
@@ -269,6 +314,7 @@ def record_task_archive_status(
     hf_path: str | None = None,
     error: str | None = None,
     archive_reason: str | None = None,
+    content_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     ledger_path = task_archive_ledger_path(config)
     with _TASK_ARCHIVE_LOCK:
@@ -286,6 +332,8 @@ def record_task_archive_status(
         }
         if archive_reason is not None:
             updated["archive_reason"] = archive_reason
+        if content_fingerprint is not None:
+            updated["content_fingerprint"] = content_fingerprint
         updated.setdefault("created_at", updated["updated_at"])
         if hf_path is not None:
             updated["hf_path"] = hf_path
@@ -353,6 +401,7 @@ def task_archive_jsonl_row(
         "task_name": task.task_name,
         "task_root_name": task_root.name,
         "pool_task": task.to_dict(),
+        "content_fingerprint": task_content_fingerprint(task_root),
         "king": king.to_dict() if king is not None else None,
         "task_metadata": _read_json_file(task_root / "task" / "task.json"),
         "commit_metadata": _read_json_file(task_root / "task" / "commit.json"),
@@ -456,6 +505,7 @@ def archive_pool_task_to_hf_jsonl(
             return
         hour = archive_entry_hour(existing)
         hf_path = task_archive_jsonl_path(pool_label, hour)
+        content_fingerprint = task_content_fingerprint(Path(task.task_root))
         record_task_archive_status(
             config=config,
             task_name=task.task_name,
@@ -464,6 +514,7 @@ def archive_pool_task_to_hf_jsonl(
             archive_hour_value=hour,
             hf_path=hf_path,
             archive_reason=archive_reason,
+            content_fingerprint=content_fingerprint,
         )
         if not upload_now:
             return
@@ -486,6 +537,7 @@ def archive_pool_task_to_hf_jsonl(
                 hf_path=hf_path,
                 error=str(exc),
                 archive_reason=archive_reason,
+                content_fingerprint=content_fingerprint,
             )
             log.exception("Task archive[%s]: HF upload failed for %s", pool_label, task.task_name)
             return
@@ -500,6 +552,7 @@ def archive_pool_task_to_hf_jsonl(
             archive_hour_value=hour,
             hf_path=hf_path,
             archive_reason=archive_reason,
+            content_fingerprint=content_fingerprint,
         )
         deleted = retry_pending_archived_task_deletes(config, (pool,))
         lease_note = "; active lease snapshot existed" if task.task_name in leased_task_names else ""
@@ -899,6 +952,12 @@ def claim_saved_task_for_pool(
             | archived_task_names(config)
             | (extra_exclude or set())
         )
+        existing_fingerprints = (
+            _task_root_fingerprints(_pool_task_roots(pool))
+            | _task_root_fingerprints(config.tasks_root / name for name in pool_task_names_from_disk(config.validate_root))
+            | _task_root_fingerprints(config.tasks_root / name for name in (extra_exclude or set()))
+            | archived_task_fingerprints(config)
+        )
         candidates = [
             task_dir
             for task_dir in sorted(config.tasks_root.glob("validate-*"), key=lambda p: p.name)
@@ -906,6 +965,7 @@ def claim_saved_task_for_pool(
                 saved_task_can_fill_pool(task_dir)
                 and task_dir.name not in existing
                 and task_dir.name not in _SAVED_TASK_FILL_IN_FLIGHT
+                and task_content_fingerprint(task_dir) not in existing_fingerprints
             )
         ]
         if not candidates:
@@ -1158,6 +1218,16 @@ def _prepare_one_task_for_pool(
         with _POOL_FILL_ADD_LOCK:
             leased_task_names = v._active_duel_task_names(current_state)
             pending_archive_names = pending_archive_task_names(config)
+            candidate_fingerprint = task_content_fingerprint(Path(candidate.task_root))
+            existing_fingerprints = (
+                _task_root_fingerprints(_pool_task_roots(pool))
+                | _task_root_fingerprints(config.tasks_root / name for name in leased_task_names)
+                | _task_root_fingerprints(config.tasks_root / name for name in pending_archive_names)
+                | archived_task_fingerprints(config)
+            )
+            if candidate_fingerprint and candidate_fingerprint in existing_fingerprints:
+                log.info("Pool manager[%s]: skipping %s (duplicate task content)", pool_label, task_name)
+                return False
             should_archive = archive_rotation and archive_reservation_name is not None
             if should_archive:
                 if archive_quota_remaining(
@@ -1204,6 +1274,7 @@ def _prepare_one_task_for_pool(
                     status="pool_inserted",
                     archive_hour_value=hour,
                     hf_path=task_archive_jsonl_path(pool_label, hour),
+                    content_fingerprint=task_content_fingerprint(Path(archive_task.task_root)),
                 )
                 release_archive_reservation(config=config, task_name=archive_reservation_name)
                 archive_reservation_name = None

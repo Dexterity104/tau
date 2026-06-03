@@ -36,13 +36,14 @@ from validate import (  # noqa: E402
     _remove_compare_artifacts,
     _remove_solution_artifacts,
 )
+from task_pool_manager import task_content_fingerprint  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch-repair saved validator tasks into the shared task pool.")
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument("--netuid", type=int, default=66)
-    parser.add_argument("--solver-model", required=True)
+    parser.add_argument("--solver-model")
     parser.add_argument("--solver-provider-sort")
     parser.add_argument("--solver-provider-only")
     parser.add_argument("--solver-provider-disable-fallbacks", action="store_true")
@@ -65,6 +66,16 @@ def _parse_args() -> argparse.Namespace:
         "--only-missing-baseline",
         action="store_true",
         help="Repair only tasks missing baseline artifacts.",
+    )
+    parser.add_argument(
+        "--dedupe-current-pools",
+        action="store_true",
+        help="Remove duplicate task-content entries from the existing primary/retest pools.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the duplicate pool entries that would be removed without deleting pool JSON files.",
     )
     return parser.parse_args()
 
@@ -186,6 +197,76 @@ def _pool_for_name(paths: any, pool_name: str) -> TaskPool:
     return TaskPool(paths.pool_dir)
 
 
+def _pool_json_path(paths: any, pool_name: str, task_name: str) -> Path:
+    pool_dir = paths.retest_pool_dir if pool_name == "retest" else paths.pool_dir
+    return pool_dir / f"{task_name}.json"
+
+
+def _pool_task_fingerprint(task: PoolTask) -> str | None:
+    return task_content_fingerprint(Path(task.task_root))
+
+
+def _dedupe_sort_key(active_names: set[str], pool_name: str, task: PoolTask) -> tuple[int, int, int, str]:
+    return (
+        0 if task.task_name in active_names else 1,
+        0 if pool_name == "main" else 1,
+        int(task.creation_block),
+        task.task_name,
+    )
+
+
+def _duplicate_pool_entries(
+    *,
+    paths: any,
+    pools: dict[str, TaskPool],
+    active_names: set[str],
+) -> list[tuple[str, PoolTask, str, PoolTask]]:
+    grouped: dict[str, list[tuple[str, PoolTask]]] = {}
+    for pool_name, pool in pools.items():
+        for task in pool.list_tasks():
+            fingerprint = _pool_task_fingerprint(task)
+            if fingerprint:
+                grouped.setdefault(fingerprint, []).append((pool_name, task))
+
+    duplicates: list[tuple[str, PoolTask, str, PoolTask]] = []
+    for entries in grouped.values():
+        if len(entries) <= 1:
+            continue
+        ordered = sorted(entries, key=lambda item: _dedupe_sort_key(active_names, item[0], item[1]))
+        keep_pool, keep_task = ordered[0]
+        duplicates.extend((remove_pool, remove_task, keep_pool, keep_task) for remove_pool, remove_task in ordered[1:])
+    return sorted(
+        duplicates,
+        key=lambda item: (item[0], item[1].creation_block, item[1].task_name),
+    )
+
+
+def _dedupe_current_pools(*, config: RunConfig, dry_run: bool) -> int:
+    validate_root = config.workspace_root / "workspace" / "validate" / f"netuid-{config.validate_netuid}"
+    paths = _prepare_validate_paths(validate_root)
+    active_names = _priority_task_names(validate_root)
+    pools = {
+        "main": TaskPool(paths.pool_dir),
+        "retest": TaskPool(paths.retest_pool_dir),
+    }
+    duplicates = _duplicate_pool_entries(paths=paths, pools=pools, active_names=active_names)
+    if not duplicates:
+        print("dedupe pools: no duplicate task content found")
+        return 0
+
+    print(f"dedupe pools: duplicate entries={len(duplicates)} dry_run={dry_run}")
+    removed = 0
+    for pool_name, task, keep_pool, keep_task in duplicates:
+        action = "would remove" if dry_run else "remove"
+        print(f"{action} {pool_name}:{task.task_name} duplicate_of={keep_pool}:{keep_task.task_name}")
+        if dry_run:
+            continue
+        _pool_json_path(paths, pool_name, task.task_name).unlink(missing_ok=True)
+        removed += 1
+    print(f"dedupe pools summary: removed={removed} remaining_main={pools['main'].size()} remaining_retest={pools['retest'].size()}")
+    return 0
+
+
 def _repair_one_task(
     *,
     task_name: str,
@@ -275,6 +356,10 @@ def _repair_one_task(
 def main() -> int:
     args = _parse_args()
     config = _build_config(args)
+    if args.dedupe_current_pools:
+        return _dedupe_current_pools(config=config, dry_run=args.dry_run)
+    if not args.solver_model:
+        raise SystemExit("--solver-model is required unless --dedupe-current-pools is used")
     validate_root = config.workspace_root / "workspace" / "validate" / f"netuid-{config.validate_netuid}"
     paths = _prepare_validate_paths(validate_root)
     pool = _pool_for_name(paths, args.pool)
