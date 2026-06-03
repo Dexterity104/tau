@@ -1636,8 +1636,13 @@ class PrivateSubmissionApiTest(unittest.TestCase):
         self.assertIn("hail-mary", call["system_prompt"])
         self.assertIn("real_edit_score", call["system_prompt"])
         self.assertIn("Deletion is not itself a", call["system_prompt"])
-        self.assertIn("deletion is not a score boost", call["system_prompt"])
+        self.assertIn("small amount of positive credit", call["system_prompt"])
+        self.assertIn("credit modest", call["system_prompt"])
         self.assertIn("<submission_data>", call["prompt"])
+        self.assertIn('"patch": "diff"', call["prompt"])
+        self.assertIn("base_agent_py", call["prompt"])
+        self.assertIn("submitted_agent_py", call["prompt"])
+        self.assertIn("full text of the current public", call["system_prompt"])
         self.assertNotIn("<pr_data>", call["prompt"])
 
     def test_solve_spend_payload_sums_recent_solve_costs(self):

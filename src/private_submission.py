@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-DEFAULT_OPENROUTER_MIN_SCORE = 70
+DEFAULT_OPENROUTER_MIN_SCORE = 65
 PRIVATE_SUBMISSION_ACCEPTANCE_LEDGER = "_accepted_submissions.json"
 PRIVATE_SUBMISSION_QUEUE_WAKEUP = "_queue_wakeup"
 PRIVATE_SUBMISSION_ATTEMPT_LEDGER = "_submission_attempts.json"
