@@ -1731,7 +1731,15 @@ def _resolve_agent_source(raw_value: str, *, cwd: Path) -> SolverAgentSource:
 
     candidate_path = Path(value).expanduser()
     if candidate_path.exists():
-        resolved = _resolve_local_agent_file(candidate_path.resolve())
+        local_path = candidate_path.resolve()
+        resolved = _resolve_local_agent_file(local_path)
+        if local_path.is_dir():
+            return SolverAgentSource(
+                raw=value,
+                kind="local_path",
+                local_path=str(local_path),
+                agent_file=resolved.relative_to(local_path).as_posix(),
+            )
         return SolverAgentSource(
             raw=value,
             kind="local_file",
@@ -1745,6 +1753,13 @@ def _resolve_agent_source(raw_value: str, *, cwd: Path) -> SolverAgentSource:
     relative_candidate = (cwd / candidate_path).resolve()
     if relative_candidate.exists():
         resolved = _resolve_local_agent_file(relative_candidate)
+        if relative_candidate.is_dir():
+            return SolverAgentSource(
+                raw=value,
+                kind="local_path",
+                local_path=str(relative_candidate),
+                agent_file=resolved.relative_to(relative_candidate).as_posix(),
+            )
         return SolverAgentSource(
             raw=value,
             kind="local_file",

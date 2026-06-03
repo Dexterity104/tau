@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -54,7 +55,7 @@ CMD ["bash"]
 
 _CONTAINER_ROOT = "/work"
 _CONTAINER_REPO_DIR = f"{_CONTAINER_ROOT}/repo"
-_CONTAINER_AGENT_FILE = f"{_CONTAINER_ROOT}/agent.py"
+_CONTAINER_AGENT_DIR = f"{_CONTAINER_ROOT}/agent-src"
 _CONTAINER_PROMPT_FILE = f"{_CONTAINER_ROOT}/task.txt"
 _CONTAINER_RUNNER_FILE = f"{_CONTAINER_ROOT}/run_single_file_agent.py"
 _CONTAINER_PROXY_SOCKET_DIR = "/proxy-socket"
@@ -146,7 +147,7 @@ def solve_task_in_docker(
         # Widen permissions so the Docker container user can reach the socket.
         os.chmod(proxy_socket_dir, 0o755)
         agent_src_path = Path(agent_src_dir)
-        agent_file = _materialize_agent_source(config=config, target_dir=agent_src_path)
+        agent_root, agent_file = _materialize_agent_source(config=config, target_dir=agent_src_path)
         rollout_started_at = utc_now()
         agent_hash = _file_sha256(agent_file)
         rollout_id_value = make_rollout_id(
@@ -189,11 +190,16 @@ def solve_task_in_docker(
                     proxy_socket_dir=Path(proxy_socket_dir),
                 )
                 _copy_repo_to_container(repo_dir=repo_dir, container_id=container_id)
-                _copy_agent_file_to_container(agent_file=agent_file, container_id=container_id)
+                container_agent_file = _copy_agent_source_to_container(
+                    agent_root=agent_root,
+                    agent_file=agent_file,
+                    container_id=container_id,
+                )
                 _copy_prompt_to_container(prompt=issue, container_id=container_id)
                 _copy_harness_runner_to_container(container_id=container_id)
                 solver_run = _run_solver_command(
                     container_id=container_id,
+                    container_agent_file=container_agent_file,
                     proxy=proxy,
                     timeout=timeout,
                     max_output_bytes=config.docker_solver_max_output_bytes,
@@ -409,12 +415,20 @@ def _copy_repo_to_container(*, repo_dir: Path, container_id: str) -> None:
     _sanitize_repo_git_metadata_in_container(container_id=container_id, repo_dir=_CONTAINER_REPO_DIR)
 
 
-def _copy_agent_file_to_container(*, agent_file: Path, container_id: str) -> None:
-    _write_text_to_container(
-        container_id=container_id,
-        target_path=_CONTAINER_AGENT_FILE,
-        content=agent_file.read_text(encoding="utf-8"),
+def _copy_agent_source_to_container(*, agent_root: Path, agent_file: Path, container_id: str) -> str:
+    source_root = agent_root.resolve()
+    source_file = agent_file.resolve()
+    try:
+        relative_agent_file = source_file.relative_to(source_root)
+    except ValueError as exc:
+        raise RuntimeError(f"Agent file must be inside agent source root: {source_file}") from exc
+
+    _run(
+        ["docker", "exec", container_id, "bash", "-lc", f"rm -rf {_CONTAINER_AGENT_DIR} && mkdir -p {_CONTAINER_AGENT_DIR}"],
+        timeout=30,
     )
+    _copy_directory_to_container(source_dir=source_root, container_id=container_id, target_dir=_CONTAINER_AGENT_DIR)
+    return f"{_CONTAINER_AGENT_DIR}/{relative_agent_file.as_posix()}"
 
 
 def _copy_prompt_to_container(*, prompt: str, container_id: str) -> None:
@@ -563,6 +577,7 @@ def _write_text_to_container(*, container_id: str, target_path: str, content: st
 def _run_solver_command(
     *,
     container_id: str,
+    container_agent_file: str,
     proxy: OpenRouterProxy,
     timeout: int,
     max_output_bytes: int,
@@ -581,7 +596,7 @@ def _run_solver_command(
         "-e",
         f"TAU_PROMPT_FILE={_CONTAINER_PROMPT_FILE}",
         "-e",
-        f"TAU_AGENT_FILE={_CONTAINER_AGENT_FILE}",
+        f"TAU_AGENT_FILE={container_agent_file}",
         "-e",
         f"TAU_HARNESS_RUNNER={_CONTAINER_RUNNER_FILE}",
         "-e",
@@ -1246,6 +1261,9 @@ def _harness_runner_script() -> str:
 
 
         def _load_agent(path):
+            agent_dir = str(path.parent)
+            if agent_dir not in sys.path:
+                sys.path.insert(0, agent_dir)
             spec = importlib.util.spec_from_file_location("submitted_agent", str(path))
             if spec is None or spec.loader is None:
                 raise RuntimeError(f"Unable to import agent file: {path}")
@@ -1905,7 +1923,7 @@ def _validate_agent_file(agent_file: Path) -> Path:
     return agent_file
 
 
-def _materialize_agent_source(*, config: RunConfig, target_dir: Path) -> Path:
+def _materialize_agent_source(*, config: RunConfig, target_dir: Path) -> tuple[Path, Path]:
     agent = config.solver_agent_source
     if agent is None:
         raise RuntimeError("Docker solver agent is not configured")
@@ -1913,10 +1931,17 @@ def _materialize_agent_source(*, config: RunConfig, target_dir: Path) -> Path:
     if agent.kind in {"local_file", "local_path"}:
         if not agent.local_path:
             raise RuntimeError("Docker solver local agent file is missing")
-        agent_file = Path(agent.local_path).expanduser().resolve()
-        if agent_file.is_dir():
-            agent_file = agent_file / (agent.agent_file or _DEFAULT_AGENT_FILE)
-        return _validate_agent_file(agent_file)
+        local_path = Path(agent.local_path).expanduser().resolve()
+        if local_path.is_dir():
+            agent_root = local_path
+            agent_file = agent_root / (agent.agent_file or _DEFAULT_AGENT_FILE)
+            return agent_root, _validate_agent_file(agent_file)
+
+        agent_file = _validate_agent_file(local_path)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        copied_agent_file = target_dir / agent_file.name
+        shutil.copy2(agent_file, copied_agent_file)
+        return target_dir, _validate_agent_file(copied_agent_file)
 
     if agent.kind == "github_repo":
         if not agent.repo_url:
@@ -1997,6 +2022,6 @@ def _materialize_agent_source(*, config: RunConfig, target_dir: Path) -> Path:
         agent_file = target_dir / (agent.agent_file or _DEFAULT_AGENT_FILE)
         if not agent_file.is_file():
             raise RuntimeError(f"Resolved agent file does not exist in cloned repo: {agent_file}")
-        return _validate_agent_file(agent_file)
+        return target_dir, _validate_agent_file(agent_file)
 
     raise RuntimeError(f"Unsupported docker solver agent kind: {agent.kind}")
