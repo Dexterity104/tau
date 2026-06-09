@@ -9,7 +9,7 @@ import re
 import shutil
 import tempfile
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
