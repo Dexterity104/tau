@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import random
 import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from dataclasses import asdict, dataclass
 from urllib.parse import urlencode
 
@@ -20,6 +22,41 @@ _RATE_LIMIT_COOLDOWN = 60  # seconds to wait before reusing a rate-limited token
 _RECENT_EVENTS_CACHE_TTL_SECONDS = 60.0
 _RECENT_EVENTS_CACHE_LOCK = threading.Lock()
 _RECENT_EVENTS_CACHE: tuple[float, list[dict]] | None = None
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+# The /events firehose only exposes the last few minutes of GitHub-wide
+# activity, so every worker keeps sampling the same handful of just-pushed
+# HEAD commits -> lots of near-identical (duplicate) tasks. Instead, task
+# generation picks a random historical day in [MIN_DAYS, MAX_DAYS] back and
+# pulls a commit from that day via the global commit-search API, which spreads
+# tasks across a broad range of dates and repositories and sharply cuts dupes.
+# The firehose is kept only as a fallback when search is unavailable/rate
+# limited. All tunable via env.
+_HISTORY_SAMPLE_MIN_DAYS = _env_int("TAU_MINER_HISTORY_SAMPLE_MIN_DAYS", 30)
+_HISTORY_SAMPLE_MAX_DAYS = _env_int("TAU_MINER_HISTORY_SAMPLE_MAX_DAYS", 1095)
+# Per-page size for commit search; search results are capped at 1000 total
+# (page * per_page), so the random page is bounded accordingly.
+_SEARCH_PER_PAGE = _env_int("TAU_MINER_SEARCH_PER_PAGE", 30)
+# How many pages of the recent-events firehose to pull on a cache miss (only
+# used by the fallback path). More pages -> a wider pool of distinct repos.
+_EVENT_PAGES_TO_FETCH = _env_int("TAU_MINER_EVENT_PAGES", 4)
+
+# The commit-search API is rate-limited (~30 req/min/token), so we cannot
+# search once per task. Instead one search backfills a shared buffer with all
+# the commits it returns (~_SEARCH_PER_PAGE), and workers pop from it; a refill
+# only triggers when the buffer drains. On a failed/empty search we back off
+# briefly and fall back to the events firehose.
+_DATE_COMMIT_BUFFER: list[tuple[str, str]] = []
+_DATE_COMMIT_BUFFER_LOCK = threading.Lock()
+_DATE_COMMIT_SEARCH_COOLDOWN_UNTIL = 0.0
+_SEARCH_FAIL_COOLDOWN_SECONDS = float(_env_int("TAU_MINER_SEARCH_FAIL_COOLDOWN_SECONDS", 10))
 
 
 def _token_fingerprint(token: str) -> str:
@@ -333,23 +370,31 @@ class GitHubMiner:
 
     def sample_commit(self, max_attempts: int = 25) -> CommitCandidate:
         last_error: str | None = None
-        events = self._recent_push_events()
-        if not events:
-            raise ValueError("No recent push events available")
+        events: list[dict] | None = None
         for attempt in range(1, max_attempts + 1):
             try:
                 log.debug("Mining attempt %s/%s", attempt, max_attempts)
-                event = self._rng.choice(events)
-                log.debug(
-                    "Selected push event id=%s repo=%s created_at=%s",
-                    event.get("id"),
-                    event.get("repo", {}).get("name"),
-                    event.get("created_at"),
-                )
-                commit_sha = self._pick_random_commit_sha(event)
+                repo_full_name: str | None = None
+                commit_sha: str | None = None
+                event_id = ""
+                pick = self._sample_commit_by_random_day()
+                if pick is not None:
+                    repo_full_name, commit_sha = pick
+                else:
+                    # Fallback: recent-events firehose (search unavailable/rate limited).
+                    if events is None:
+                        events = self._recent_push_events()
+                    if not events:
+                        last_error = "No commits from date search and no recent push events"
+                        log.debug(last_error)
+                        continue
+                    event = self._rng.choice(events)
+                    repo_full_name = event["repo"]["name"]
+                    event_id = str(event.get("id", ""))
+                    commit_sha = self._pick_random_commit_sha(event)
                 candidate = self._fetch_commit_candidate(
-                    repo_full_name=event["repo"]["name"],
-                    event_id=str(event.get("id", "")),
+                    repo_full_name=repo_full_name,
+                    event_id=event_id,
                     commit_sha=commit_sha,
                 )
             except (httpx.HTTPError, KeyError, RuntimeError, ValueError) as exc:
@@ -461,10 +506,72 @@ class GitHubMiner:
         pages = self._extract_available_pages(response.headers.get("link", "")) if response else [1]
         valid_pages = [page for page in pages if page > 1]
         if valid_pages:
-            page = self._rng.choice(valid_pages)
-            log.debug("Fetching additional public events page %s", page)
-            events.extend(self._get_json("/events", page=page, per_page=30))
+            self._rng.shuffle(valid_pages)
+            for page in valid_pages[: max(0, _EVENT_PAGES_TO_FETCH - 1)]:
+                log.debug("Fetching additional public events page %s", page)
+                try:
+                    events.extend(self._get_json("/events", page=page, per_page=30))
+                except (httpx.HTTPError, ValueError, KeyError, RuntimeError) as exc:
+                    log.debug("Failed to fetch events page %s: %s", page, exc)
+                    break
         return [event for event in events if event.get("type") == "PushEvent"]
+
+    def _sample_commit_by_random_day(self) -> tuple[str, str] | None:
+        """Return (repo, sha) for a commit from a random historical day.
+
+        This is the primary task-generation path: it draws commits from a broad
+        range of dates and repositories instead of the recent-events firehose,
+        which keeps surfacing the same just-pushed commits. Pops from a shared
+        buffer that one search call backfills, so we stay well under the
+        commit-search rate limit. Returns None when the buffer is empty and a
+        refill is unavailable (rate limited / in cooldown) so callers fall back."""
+        global _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL
+        with _DATE_COMMIT_BUFFER_LOCK:
+            if _DATE_COMMIT_BUFFER:
+                return _DATE_COMMIT_BUFFER.pop()
+            if time.monotonic() < _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL:
+                return None
+            commits = self._search_commits_for_random_day()
+            if not commits:
+                _DATE_COMMIT_SEARCH_COOLDOWN_UNTIL = time.monotonic() + _SEARCH_FAIL_COOLDOWN_SECONDS
+                return None
+            self._rng.shuffle(commits)
+            _DATE_COMMIT_BUFFER.extend(commits)
+            return _DATE_COMMIT_BUFFER.pop()
+
+    def _search_commits_for_random_day(self) -> list[tuple[str, str]]:
+        """One commit-search call for a random day; returns all (repo, sha) hits."""
+        days_back = self._rng.randint(_HISTORY_SAMPLE_MIN_DAYS, _HISTORY_SAMPLE_MAX_DAYS)
+        day = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        per_page = max(1, _SEARCH_PER_PAGE)
+        # Search results are capped at 1000 total (page * per_page).
+        max_page = max(1, 1000 // per_page)
+        page = self._rng.randint(1, max_page)
+        try:
+            payload = self._get_json(
+                "/search/commits",
+                q=f"committer-date:{day}",
+                sort="committer-date",
+                order=self._rng.choice(["asc", "desc"]),
+                per_page=per_page,
+                page=page,
+            )
+        except (httpx.HTTPError, ValueError, KeyError, RuntimeError) as exc:
+            log.debug("Commit search failed for day %s: %s", day, exc)
+            return []
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not items:
+            return []
+        results: list[tuple[str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            repo = (item.get("repository") or {}).get("full_name")
+            sha = item.get("sha")
+            if repo and sha:
+                results.append((str(repo), str(sha)))
+        log.debug("Date-search day %s page %s -> %d commits", day, page, len(results))
+        return results
 
     def _pick_random_commit_sha(self, event: dict) -> str:
         commits = _push_event_commits_with_code_hints(event)

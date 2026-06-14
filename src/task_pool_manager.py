@@ -37,6 +37,15 @@ _SAVED_TASK_FILL_IN_FLIGHT: set[str] = set()
 _SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS: dict[str, str] = {}
 _POOL_FILL_ADD_LOCK = threading.Lock()
 _POOL_FILLER_WORKER_OVERSUBSCRIBE = 1
+# Throttle concurrent GitHub-sourced task generation independently of solve
+# concurrency. Pool-filler workers each call generate_task_run() (GitHub commit
+# sampling) before solving; without a cap, every worker can hammer the GitHub
+# API simultaneously and trip secondary rate limits. Solve concurrency can be
+# scaled high while generation stays bounded here. Tunable via env; reversible.
+_POOL_GENERATION_CONCURRENCY = max(
+    1, int(os.environ.get("TAU_POOL_GENERATION_CONCURRENCY", "8") or "8")
+)
+_POOL_GENERATION_SEMAPHORE = threading.BoundedSemaphore(_POOL_GENERATION_CONCURRENCY)
 _ARCHIVE_UPLOAD_COMPLETE_STATUSES = {"uploaded_delete_pending", "uploaded_deleted"}
 _ARCHIVE_UPLOAD_RETRY_STATUSES = {"pool_inserted", "upload_failed"}
 _ARCHIVE_QUOTA_USED_STATUSES = {
@@ -1117,6 +1126,7 @@ def _prepare_one_task_for_pool(
     saved_task_name: str | None = None
     archive_reservation_name: str | None = None
     archive_reservation_hour: str | None = None
+    reserved_fingerprint_name: str | None = None
     added_to_pool = False
     try:
         if config.validate_task_pool_fill_from_saved:
@@ -1141,7 +1151,8 @@ def _prepare_one_task_for_pool(
                     return False
                 archive_reservation_name = task_name
                 archive_reservation_hour = str(reservation["archive_hour"])
-            generate_result = generate_task_run(task_name=task_name, config=config)
+            with _POOL_GENERATION_SEMAPHORE:
+                generate_result = generate_task_run(task_name=task_name, config=config)
             task_root = generate_result.task_root
             generated_task_root = Path(task_root)
             log.info("Pool manager[%s]: generated task %s", pool_label, task_name)
@@ -1157,6 +1168,26 @@ def _prepare_one_task_for_pool(
         if v._count_patch_lines(Path(task_root) / "task" / "reference.patch") < v._MIN_PATCH_LINES:
             log.info("Pool manager[%s]: skipping %s (patch too small)", pool_label, task_name)
             return False
+
+        # Reject duplicate task content BEFORE spending any baseline/king solve
+        # compute. The insert-time check below remains the final guard; this
+        # avoids burning solves on commits already pooled/archived or currently
+        # being solved by another worker, and reserves this fingerprint so
+        # concurrent workers skip the same freshly generated commit.
+        early_fingerprint = task_content_fingerprint(Path(task_root))
+        if early_fingerprint:
+            with _SAVED_TASK_FILL_LOCK:
+                known_fingerprints = (
+                    _task_root_fingerprints(_pool_task_roots(pool))
+                    | _task_root_fingerprints(_pool_task_roots_from_disk(config))
+                    | set(_SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS.values())
+                    | archived_task_fingerprints(config)
+                )
+                if early_fingerprint in known_fingerprints:
+                    log.info("Pool manager[%s]: skipping %s (duplicate task content, pre-solve)", pool_label, task_name)
+                    return False
+                _SAVED_TASK_FILL_IN_FLIGHT_FINGERPRINTS[task_name] = early_fingerprint
+                reserved_fingerprint_name = task_name
 
         cached_baseline = baseline_summary_for_pool_task(
             config=config,
@@ -1326,6 +1357,8 @@ def _prepare_one_task_for_pool(
         return False
     finally:
         release_saved_task_claim(saved_task_name)
+        if reserved_fingerprint_name is not None and reserved_fingerprint_name != saved_task_name:
+            release_saved_task_claim(reserved_fingerprint_name)
         release_archive_reservation(config=config, task_name=archive_reservation_name)
         if not added_to_pool and generated_task_root is not None and generated_task_root.exists():
             shutil.rmtree(generated_task_root, ignore_errors=True)

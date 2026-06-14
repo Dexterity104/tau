@@ -84,7 +84,7 @@ _BURN_KING_COMMITMENT_PREFIX = "burn:uid-0"
 _BASELINE_MODEL = "gemini-3-flash"
 _REFERENCE_SOLUTION_NAME = "reference"
 _LEGACY_BASELINE_SOLUTION_NAME = "baseline"
-_DIFF_JUDGE_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+_DIFF_JUDGE_MODEL = "minimax/minimax-m2.7"
 _DIFF_JUDGE_FALLBACK_MODELS = ()
 _DIFF_JUDGE_WEIGHT = 1.0
 _DIFF_JUDGE_TIMEOUT_SECONDS = 120
@@ -6864,6 +6864,7 @@ def _build_submission(*, subtensor, github_client, config, hotkey, commitment, c
 def _ensure_king(*, state: ValidatorState, github_client: GitHubClient, config: RunConfig) -> None:
     if state.current_king:
         return
+    state.current_king = _build_burn_king(github_client=github_client, config=config)
 
 
 def _build_burn_king(*, github_client: GitHubClient, config: RunConfig) -> ValidatorSubmission:
