@@ -1,14 +1,26 @@
 import unittest
 from unittest.mock import patch
 
+import httpx
+
 from openrouter_client import complete_text
 
 
 class _FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, *, status_code: int = 200, headers: dict[str, str] | None = None):
         self._payload = payload
+        self.status_code = status_code
+        self.headers = httpx.Headers(headers or {})
+        self.text = ""
 
     def raise_for_status(self):
+        if self.status_code >= 400:
+            request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+            raise httpx.HTTPStatusError(
+                "rate limited",
+                request=request,
+                response=httpx.Response(self.status_code, request=request, json=self._payload),
+            )
         return None
 
     def json(self):
@@ -202,6 +214,48 @@ class OpenRouterClientTest(unittest.TestCase):
             client.request_url,
             "https://example.test/custom/v1/chat/completions",
         )
+
+    def test_complete_text_retries_rate_limited_upstream_response(self):
+        ok_response = _FakeResponse(
+            {
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"},
+                ],
+            },
+        )
+        rate_limited = _FakeResponse(
+            {"error": {"code": 429, "message": "rate limited by upstream provider"}},
+            status_code=429,
+            headers={"retry-after": "2"},
+        )
+        call_count = {"value": 0}
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, headers, json):
+                call_count["value"] += 1
+                if call_count["value"] == 1:
+                    rate_limited.raise_for_status()
+                return ok_response
+
+        with patch("openrouter_client.httpx.Client", return_value=_Client()):
+            with patch("openrouter_client.time.sleep") as sleep_mock:
+                text = complete_text(
+                    prompt="judge",
+                    model="google/gemini-3.1-flash-lite",
+                    timeout=10,
+                    openrouter_api_key="key",
+                    rate_limit_retries=3,
+                )
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(call_count["value"], 2)
+        sleep_mock.assert_called_once_with(2.0)
 
 
 if __name__ == "__main__":

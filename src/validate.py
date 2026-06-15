@@ -25,7 +25,7 @@ from urllib.parse import parse_qsl, quote
 import httpx
 
 from config import RunConfig, SolverAgentSource
-from openrouter_client import complete_text
+from openrouter_client import complete_text, is_retryable_openrouter_rate_limit, resolve_rate_limit_retries
 from pipeline import _setup_logging, solve_task_run
 from private_submission import (
     MAX_AGENT_FILES,
@@ -1619,6 +1619,8 @@ def _judge_round_diffs(
     task_name: str,
     challenger_solution_name: str,
     config: RunConfig,
+    duel_id: int | None = None,
+    judge_semaphore: threading.Semaphore | None = None,
 ) -> DiffJudgeResult:
     cancel = threading.Event()
     executor = _DaemonThreadExecutor(thread_name_prefix="diff-judge")
@@ -1629,6 +1631,8 @@ def _judge_round_diffs(
             challenger_solution_name=challenger_solution_name,
             config=config,
             cancel=cancel,
+            duel_id=duel_id,
+            judge_semaphore=judge_semaphore,
         )
         try:
             return future.result(timeout=_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS)
@@ -1649,15 +1653,30 @@ def _judge_round_diffs(
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _acquire_diff_judge_semaphore(*, deadline: float, cancel: threading.Event) -> bool:
+def _diff_judge_semaphore_value(semaphore: threading.Semaphore) -> int | None:
+    value = getattr(semaphore, "_value", None)
+    return int(value) if isinstance(value, int) else None
+
+
+def _diff_judge_daemon_thread_count() -> int:
+    return sum(1 for thread in threading.enumerate() if thread.name.startswith("diff-judge"))
+
+
+def _acquire_diff_judge_semaphore(
+    *,
+    deadline: float,
+    cancel: threading.Event,
+    semaphore: threading.Semaphore,
+) -> tuple[bool, float]:
+    started = time.monotonic()
     while True:
         if cancel.is_set():
-            return False
+            return False, (time.monotonic() - started) * 1000
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return False
-        if _DIFF_JUDGE_SEMAPHORE.acquire(timeout=min(remaining, 1.0)):
-            return True
+            return False, (time.monotonic() - started) * 1000
+        if semaphore.acquire(timeout=min(remaining, 1.0)):
+            return True, (time.monotonic() - started) * 1000
 
 
 def _judge_round_diffs_uncapped(
@@ -1666,6 +1685,8 @@ def _judge_round_diffs_uncapped(
     challenger_solution_name: str,
     config: RunConfig,
     cancel: threading.Event | None = None,
+    duel_id: int | None = None,
+    judge_semaphore: threading.Semaphore | None = None,
 ) -> DiffJudgeResult:
     """Judge two role-blinded solution diffs for one round through OpenRouter.
 
@@ -1705,6 +1726,7 @@ def _judge_round_diffs_uncapped(
 
     last_error: str | None = None
     cancel_event = cancel or threading.Event()
+    semaphore = judge_semaphore or _DIFF_JUDGE_SEMAPHORE
     deadline = time.monotonic() + _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS
     for model in _DIFF_JUDGE_MODELS:
         if cancel_event.is_set():
@@ -1733,15 +1755,34 @@ def _judge_round_diffs_uncapped(
             if remaining <= 0:
                 break
             try:
-                if not _acquire_diff_judge_semaphore(deadline=deadline, cancel=cancel_event):
+                acquired, acquire_wait_ms = _acquire_diff_judge_semaphore(
+                    deadline=deadline,
+                    cancel=cancel_event,
+                    semaphore=semaphore,
+                )
+                if not acquired:
+                    log.warning(
+                        "Diff judge semaphore acquire failed duel=%s task=%s solution=%s "
+                        "model=%s attempt=%d acquire_wait_ms=%.1f semaphore_value=%s "
+                        "diff_judge_threads=%d",
+                        duel_id,
+                        task_name,
+                        challenger_solution_name,
+                        model,
+                        attempt,
+                        acquire_wait_ms,
+                        _diff_judge_semaphore_value(semaphore),
+                        _diff_judge_daemon_thread_count(),
+                    )
                     break
+                call_started = time.monotonic()
+                request_timeout = min(
+                    _DIFF_JUDGE_TIMEOUT_SECONDS,
+                    max(1, int(remaining)),
+                )
                 try:
                     if cancel_event.is_set():
                         break
-                    request_timeout = min(
-                        _DIFF_JUDGE_TIMEOUT_SECONDS,
-                        max(1, int(remaining)),
-                    )
                     raw = complete_text(
                         prompt=prompt,
                         system_prompt=system_prompt,
@@ -1752,9 +1793,28 @@ def _judge_round_diffs_uncapped(
                         top_p=1,
                         max_tokens=_DIFF_JUDGE_MAX_TOKENS,
                         reasoning=reasoning,
+                        rate_limit_retries=resolve_rate_limit_retries(
+                            config.solver_rate_limit_retries,
+                        ),
                     )
                 finally:
-                    _DIFF_JUDGE_SEMAPHORE.release()
+                    call_elapsed_ms = (time.monotonic() - call_started) * 1000
+                    semaphore.release()
+                    log.info(
+                        "Diff judge timing duel=%s task=%s solution=%s model=%s "
+                        "attempt=%d acquire_wait_ms=%.1f call_elapsed_ms=%.1f "
+                        "timeout_s=%d semaphore_value=%s diff_judge_threads=%d",
+                        duel_id,
+                        task_name,
+                        challenger_solution_name,
+                        model,
+                        attempt,
+                        acquire_wait_ms,
+                        call_elapsed_ms,
+                        request_timeout,
+                        _diff_judge_semaphore_value(semaphore),
+                        _diff_judge_daemon_thread_count(),
+                    )
                 payload = _extract_json_object(raw)
                 if payload is None:
                     raise RuntimeError("judge did not return a JSON object")
@@ -1768,6 +1828,8 @@ def _judge_round_diffs_uncapped(
             except Exception as exc:
                 last_error = f"{model}: {exc}"
                 if _is_diff_judge_route_error(str(exc)):
+                    break
+                if is_retryable_openrouter_rate_limit(exc):
                     break
                 if attempt < _DIFF_JUDGE_ATTEMPTS:
                     time.sleep(min(attempt, max(0.0, deadline - time.monotonic())))
@@ -3258,6 +3320,7 @@ def _solve_and_compare_round(
     duel_id: int,
     pool: TaskPool | None = None,
     on_artifacts_published: Any | None = None,
+    judge_semaphore: threading.Semaphore | None = None,
 ) -> ValidationRoundResult:
     """Run a single round: solve challenger, then compare. Thread-safe."""
     solution_label = f"challenger-{challenger.uid}-d{duel_id}"
@@ -3325,6 +3388,8 @@ def _solve_and_compare_round(
             task_name=task.task_name,
             challenger_solution_name=solution_label,
             config=config,
+            duel_id=duel_id,
+            judge_semaphore=judge_semaphore,
         )
         king_time_score = _solve_time_score(
             king_elapsed_seconds, timeout_seconds=agent_timeout,
@@ -3559,6 +3624,7 @@ def _run_parallel_duel(
     log.info("Duel %d phase 2: launching %d parallel solves + judges",
              duel_id, len(tasks))
     solve_start = time.monotonic()
+    diff_judge_semaphore = threading.Semaphore(_DIFF_JUDGE_MAX_CONCURRENCY)
 
     rounds: list[ValidationRoundResult] = list(resume_rounds)
     completed_task_names = {round_result.task_name for round_result in rounds}
@@ -3642,6 +3708,7 @@ def _run_parallel_duel(
                     "config": config,
                     "duel_id": duel_id,
                     "pool": pool,
+                    "judge_semaphore": diff_judge_semaphore,
                 }
                 if on_round_complete is not None:
                     round_kwargs["on_artifacts_published"] = _note_artifacts_published
