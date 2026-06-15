@@ -1,4 +1,5 @@
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -86,7 +87,7 @@ class ReferenceScoringTest(unittest.TestCase):
 
         with (
             patch("validate.solve_task_run", return_value=SimpleNamespace(exit_reason="completed")),
-            patch("validate.compare_task_run", side_effect=fake_compare_task_run),
+            patch("validate.compare_task_run", side_effect=fake_compare_task_run, create=True),
             patch("validate._ensure_task_ready_for_king", return_value=task),
             patch("validate.publish_round_data"),
             patch("validate._build_agent_config", side_effect=lambda config, sub: config),
@@ -316,6 +317,95 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertEqual(result.winner, "challenger")
         self.assertAlmostEqual(result.king_score, 0.01)
         self.assertAlmostEqual(result.challenger_score, 0.02)
+
+    def test_diff_judge_passes_solver_rate_limit_retries_to_complete_text(self):
+        calls = []
+
+        def fake_complete_text(**kwargs):
+            calls.append(kwargs)
+            return json.dumps(
+                {
+                    "winner": "candidate_a",
+                    "candidate_a_score": 60,
+                    "candidate_b_score": 40,
+                    "rationale": "ok",
+                },
+            )
+
+        task_paths = SimpleNamespace(
+            task_txt_path=SimpleNamespace(read_text=lambda: "fix the bug"),
+            reference_patch_path=SimpleNamespace(read_text=lambda: "diff --git a/ref b/ref"),
+        )
+
+        def fake_solution_paths(_task_paths, solution_name):
+            return SimpleNamespace(
+                solution_diff_path=SimpleNamespace(
+                    read_text=lambda: f"diff --git a/{solution_name} b/{solution_name}",
+                ),
+            )
+
+        with (
+            patch("validate.resolve_task_paths", return_value=task_paths),
+            patch("validate.resolve_solution_paths", side_effect=fake_solution_paths),
+            patch("validate.complete_text", side_effect=fake_complete_text),
+        ):
+            result = validate._judge_round_diffs(
+                task_name="task-judge",
+                challenger_solution_name="challenger-7-d3",
+                config=RunConfig(openrouter_api_key="test-key", solver_rate_limit_retries=6),
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["rate_limit_retries"], 6)
+
+    def test_diff_judge_can_use_duel_scoped_semaphore_when_global_is_poisoned(self):
+        def fake_complete_text(**kwargs):
+            return json.dumps(
+                {
+                    "winner": "candidate_b",
+                    "candidate_a_score": 30,
+                    "candidate_b_score": 70,
+                    "rationale": "fresh duel semaphore was used",
+                },
+            )
+
+        task_paths = SimpleNamespace(
+            task_txt_path=SimpleNamespace(read_text=lambda: "fix the bug"),
+            reference_patch_path=SimpleNamespace(read_text=lambda: "diff --git a/ref b/ref"),
+        )
+
+        def fake_solution_paths(_task_paths, solution_name):
+            return SimpleNamespace(
+                solution_diff_path=SimpleNamespace(
+                    read_text=lambda: f"diff --git a/{solution_name} b/{solution_name}",
+                ),
+            )
+
+        acquired_global_permits = 0
+        try:
+            for _ in range(validate._DIFF_JUDGE_MAX_CONCURRENCY):
+                if validate._DIFF_JUDGE_SEMAPHORE.acquire(blocking=False):
+                    acquired_global_permits += 1
+
+            with (
+                patch("validate.resolve_task_paths", return_value=task_paths),
+                patch("validate.resolve_solution_paths", side_effect=fake_solution_paths),
+                patch("validate.complete_text", side_effect=fake_complete_text),
+                patch("validate._DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS", 0.05),
+            ):
+                result = validate._judge_round_diffs(
+                    task_name="task-judge-scoped-semaphore",
+                    challenger_solution_name="challenger-7-d3",
+                    config=RunConfig(openrouter_api_key="test-key"),
+                    duel_id=42,
+                    judge_semaphore=threading.Semaphore(1),
+                )
+        finally:
+            for _ in range(acquired_global_permits):
+                validate._DIFF_JUDGE_SEMAPHORE.release()
+
+        self.assertEqual(result.winner, "challenger")
+        self.assertIsNone(result.error)
 
     def test_diff_judge_total_timeout_returns_neutral_score(self):
         task_paths = SimpleNamespace(

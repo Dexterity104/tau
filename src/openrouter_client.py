@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 import httpx
@@ -9,6 +10,7 @@ import httpx
 import tau.utils
 from tau.io.chat_completion import assistant_text_from_payload, empty_content_error
 from tau.io.openrouter import CachedLLMClient, LLMClient, LLMRequest, normalize_base_url
+from tau.io.upstream_request_policy import DEFAULT_RATE_LIMIT_RETRIES
 
 log = logging.getLogger("swe-eval.openrouter_client")
 
@@ -88,20 +90,87 @@ def complete_text(
     max_tokens: int | None = None,
     reasoning: dict[str, Any] | None = None,
     cache_control: dict[str, Any] | None = None,
+    rate_limit_retries: int = 1,
 ) -> str:
-    return _build_client(openrouter_api_key).complete_text(
-        LLMRequest(
-            prompt=prompt,
-            model=model,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            reasoning=reasoning,
-            cache_control=cache_control,
-        ),
-        timeout=timeout,
+    request = LLMRequest(
+        prompt=prompt,
+        model=model,
+        system_prompt=system_prompt,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        reasoning=reasoning,
+        cache_control=cache_control,
     )
+    client = _build_client(openrouter_api_key)
+    max_rate_limit_retries = max(1, int(rate_limit_retries))
+    if max_rate_limit_retries <= 1:
+        return client.complete_text(request, timeout=timeout)
+
+    last_error: BaseException | None = None
+    for rate_attempt in range(max_rate_limit_retries):
+        try:
+            return client.complete_text(request, timeout=timeout)
+        except httpx.HTTPStatusError as exc:
+            if not is_retryable_openrouter_rate_limit(exc):
+                raise
+            last_error = exc
+            if rate_attempt + 1 >= max_rate_limit_retries:
+                raise
+            backoff = openrouter_rate_limit_backoff_seconds(exc.response, rate_attempt)
+            log.info(
+                "Retrying OpenRouter rate limit for model=%s (attempt %s/%s) after %.2fs",
+                _resolve_model(model),
+                rate_attempt + 2,
+                max_rate_limit_retries,
+                backoff,
+            )
+            time.sleep(backoff)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("OpenRouter rate limit retries exhausted without a response")
+
+
+def is_retryable_openrouter_rate_limit(exc: BaseException) -> bool:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    if exc.response.status_code != 429:
+        return False
+    error_text = _openrouter_error_text(exc.response).lower()
+    return (
+        "rate limit" in error_text
+        or "too many requests" in error_text
+        or "high demand" in error_text
+        or not error_text
+    )
+
+
+def openrouter_rate_limit_backoff_seconds(response: httpx.Response, attempt: int) -> float:
+    retry_after = response.headers.get("retry-after")
+    if retry_after:
+        try:
+            return min(30.0, max(0.25, float(retry_after)))
+        except ValueError:
+            pass
+    return min(30.0, 2.0 * (1.5 ** attempt))
+
+
+def resolve_rate_limit_retries(value: int | None) -> int:
+    if value is not None:
+        return max(1, int(value))
+    return DEFAULT_RATE_LIMIT_RETRIES
+
+
+def _openrouter_error_text(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        return response.text
+    if not isinstance(payload, dict):
+        return response.text
+    error = tau.utils.get_dict(payload, "error")
+    message = error.get("message")
+    return str(message) if message else ""
 
 
 def _openrouter_url() -> str:
