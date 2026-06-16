@@ -1829,6 +1829,13 @@ def _judge_round_diffs_uncapped(
     except Exception as exc:
         return _finalize(_neutral_diff_judge(f"failed to read diff judge inputs: {exc}"), outcome="input_error")
 
+    empty_patch_judgment = _diff_judge_empty_patch_result(
+        king_patch=king_patch,
+        challenger_patch=challenger_patch,
+    )
+    if empty_patch_judgment is not None:
+        return _finalize(empty_patch_judgment, outcome="empty_patch")
+
     injection_judgment = _diff_judge_prompt_injection_result(
         king_patch=king_patch,
         challenger_patch=challenger_patch,
@@ -2246,6 +2253,37 @@ def _parse_diff_judge_payload(
         challenger_score=challenger_score,
         rationale=str(payload.get("rationale") or "").strip(),
         model=model,
+    )
+
+
+def _diff_judge_empty_patch_result(
+    *,
+    king_patch: str,
+    challenger_patch: str,
+) -> DiffJudgeResult | None:
+    king_empty = not king_patch.strip()
+    challenger_empty = not challenger_patch.strip()
+    if not king_empty and not challenger_empty:
+        return None
+    if king_empty and challenger_empty:
+        return DiffJudgeResult(
+            winner="tie",
+            king_score=0.0,
+            challenger_score=0.0,
+            rationale="Automatic LLM score failure: both patches are empty.",
+        )
+    if king_empty:
+        return DiffJudgeResult(
+            winner="challenger",
+            king_score=0.0,
+            challenger_score=1.0,
+            rationale="Automatic LLM score failure: king patch is empty.",
+        )
+    return DiffJudgeResult(
+        winner="king",
+        king_score=1.0,
+        challenger_score=0.0,
+        rationale="Automatic LLM score failure: challenger patch is empty.",
     )
 
 
