@@ -1630,6 +1630,7 @@ def _judge_round_diffs(
     config: RunConfig,
     duel_id: int | None = None,
     judge_semaphore: threading.Semaphore | None = None,
+    round_cancel: threading.Event | None = None,
 ) -> DiffJudgeResult:
     cancel = threading.Event()
     executor = _DaemonThreadExecutor(thread_name_prefix="diff-judge")
@@ -1642,6 +1643,7 @@ def _judge_round_diffs(
             cancel=cancel,
             duel_id=duel_id,
             judge_semaphore=judge_semaphore,
+            round_cancel=round_cancel,
         )
         try:
             return future.result(timeout=_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS)
@@ -1696,6 +1698,7 @@ def _judge_round_diffs_uncapped(
     cancel: threading.Event | None = None,
     duel_id: int | None = None,
     judge_semaphore: threading.Semaphore | None = None,
+    round_cancel: threading.Event | None = None,
 ) -> DiffJudgeResult:
     """Judge two role-blinded solution diffs for one round through OpenRouter.
 
@@ -1737,8 +1740,12 @@ def _judge_round_diffs_uncapped(
     cancel_event = cancel or threading.Event()
     semaphore = judge_semaphore or _DIFF_JUDGE_SEMAPHORE
     deadline = time.monotonic() + _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS
+
+    def _round_aborted() -> bool:
+        return cancel_event.is_set() or (round_cancel is not None and round_cancel.is_set())
+
     for model in _DIFF_JUDGE_MODELS:
-        if cancel_event.is_set():
+        if _round_aborted():
             break
         candidate_mapping = _diff_judge_candidate_mapping(
             seed=f"{task_name}:{challenger_solution_name}:{model}",
@@ -1758,7 +1765,7 @@ def _judge_round_diffs_uncapped(
         reasoning = _diff_judge_reasoning_for_model(model)
 
         for attempt in range(1, _DIFF_JUDGE_ATTEMPTS + 1):
-            if cancel_event.is_set():
+            if _round_aborted():
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1790,7 +1797,7 @@ def _judge_round_diffs_uncapped(
                     max(1, int(remaining)),
                 )
                 try:
-                    if cancel_event.is_set():
+                    if _round_aborted():
                         break
                     raw = complete_text(
                         prompt=prompt,
@@ -1843,7 +1850,7 @@ def _judge_round_diffs_uncapped(
                 if attempt < _DIFF_JUDGE_ATTEMPTS:
                     time.sleep(min(attempt, max(0.0, deadline - time.monotonic())))
 
-    if cancel_event.is_set():
+    if _round_aborted():
         return _neutral_diff_judge(
             f"LLM diff judge exceeded {_DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS}s total timeout"
         )
@@ -3340,8 +3347,23 @@ def _solve_and_compare_round(
     pool: TaskPool | None = None,
     on_artifacts_published: Any | None = None,
     judge_semaphore: threading.Semaphore | None = None,
+    round_cancel: threading.Event | None = None,
 ) -> ValidationRoundResult:
     """Run a single round: solve challenger, then compare. Thread-safe."""
+    if round_cancel is not None and round_cancel.is_set():
+        return ValidationRoundResult(
+            task_name=task.task_name,
+            winner="error",
+            king_lines=0,
+            challenger_lines=0,
+            king_similarity_ratio=0.0,
+            challenger_similarity_ratio=0.0,
+            king_challenger_similarity=0.0,
+            task_root=task.task_root,
+            king_compare_root="",
+            challenger_compare_root="",
+            error=f"duel {duel_id} task {task.task_name} cancelled before start",
+        )
     solution_label = f"challenger-{challenger.uid}-d{duel_id}"
     try:
         task = _ensure_task_ready_for_king(
@@ -3399,6 +3421,23 @@ def _solve_and_compare_round(
                 chall_has_patch,
             )
 
+        if round_cancel is not None and round_cancel.is_set():
+            return ValidationRoundResult(
+                task_name=task.task_name,
+                winner="error",
+                king_lines=task.king_lines,
+                challenger_lines=0,
+                king_similarity_ratio=task.king_similarity,
+                challenger_similarity_ratio=0.0,
+                king_challenger_similarity=0.0,
+                task_root=task.task_root,
+                king_compare_root="",
+                challenger_compare_root="",
+                king_exit_reason=king_exit_reason,
+                challenger_exit_reason=challenger_exit_reason,
+                error=f"duel {duel_id} task {task.task_name} cancelled after solve",
+            )
+
         zero_challenger = chall_timed_out and not chall_has_patch
         c_lines = 0
         k_lines = task.king_lines
@@ -3409,6 +3448,7 @@ def _solve_and_compare_round(
             config=config,
             duel_id=duel_id,
             judge_semaphore=judge_semaphore,
+            round_cancel=round_cancel,
         )
         king_time_score = _solve_time_score(
             king_elapsed_seconds, timeout_seconds=agent_timeout,
@@ -3674,6 +3714,8 @@ def _run_parallel_duel(
     provider_account_pause_reason: str | None = None
     math_stop_reason: str | None = None
     dq_stop_reason: str | None = None
+    round_cancel = threading.Event()
+    duel_loop_break = False
 
     def _emit_progress() -> None:
         if on_round_complete is None:
@@ -3728,6 +3770,7 @@ def _run_parallel_duel(
                     "duel_id": duel_id,
                     "pool": pool,
                     "judge_semaphore": diff_judge_semaphore,
+                    "round_cancel": round_cancel,
                 }
                 if on_round_complete is not None:
                     round_kwargs["on_artifacts_published"] = _note_artifacts_published
@@ -3751,7 +3794,12 @@ def _run_parallel_duel(
 
         def _cancel_pending_rounds(reason: str) -> None:
             nonlocal pending, timed_out_clean_shutdown
+            round_cancel.set()
             if not pending:
+                try:
+                    _kill_stale_containers()
+                except Exception:
+                    log.exception("docker cleanup after duel cancellation failed (non-fatal)")
                 return
             cancelled = len(pending)
             for fut in list(pending):
@@ -3873,7 +3921,7 @@ def _run_parallel_duel(
             _emit_progress()
         if not _stop_for_dq_if_detected() and not _stop_for_math_if_decided():
             _submit_available()
-        while pending:
+        while pending and not duel_loop_break:
             now = time.monotonic()
             if cancel_event is not None and cancel_event.is_set():
                 if task_queue and stop_submitting_reason is None:
@@ -3983,6 +4031,8 @@ def _run_parallel_duel(
                         last_result_progress_emit_at = time.monotonic()
                         last_heartbeat_at = last_result_progress_emit_at
                         results_since_progress_emit = 0
+                        duel_loop_break = True
+                        break
                     should_emit_batch_progress = (
                         results_since_progress_emit >= _DASHBOARD_RESULT_BATCH_SIZE
                         or (time.monotonic() - last_result_progress_emit_at) >= _DASHBOARD_RESULT_MIN_INTERVAL
@@ -4058,10 +4108,17 @@ def _run_parallel_duel(
                 break
 
             if completed_this_slice:
+                if duel_loop_break:
+                    break
                 if stop_submitting_reason is None and not _stop_for_math_if_decided():
                     _submit_available()
                 last_heartbeat_at = time.monotonic()
                 continue
+
+            if _stop_for_dq_if_detected() or _stop_for_math_if_decided():
+                _emit_progress()
+                duel_loop_break = True
+                break
 
             # No completion this slice; emit a heartbeat publish so the
             # public dashboard stays fresh even when rounds are slow.
