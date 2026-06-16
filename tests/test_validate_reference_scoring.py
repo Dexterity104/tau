@@ -13,6 +13,7 @@ from validate import (
     ValidatorSubmission,
     _challenger_wins,
     _copy_detection_reason,
+    _diff_judge_empty_patch_result,
     _diff_judge_prompt_injection_result,
     _duel_speed_stop_reason,
     _parse_diff_judge_payload,
@@ -205,6 +206,86 @@ class ReferenceScoringTest(unittest.TestCase):
         self.assertEqual(result.winner, "challenger")
         self.assertAlmostEqual(result.king_score, 0.0)
         self.assertAlmostEqual(result.challenger_score, 1.0)
+
+    def test_diff_judge_empty_patch_result_fails_empty_challenger(self):
+        result = _diff_judge_empty_patch_result(
+            king_patch="diff --git a/foo b/foo\n+fix\n",
+            challenger_patch="\n",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.winner, "king")
+        self.assertEqual(result.king_score, 1.0)
+        self.assertEqual(result.challenger_score, 0.0)
+
+    def test_diff_judge_empty_patch_result_fails_empty_king(self):
+        result = _diff_judge_empty_patch_result(
+            king_patch="",
+            challenger_patch="diff --git a/foo b/foo\n+fix\n",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.winner, "challenger")
+        self.assertEqual(result.king_score, 0.0)
+        self.assertEqual(result.challenger_score, 1.0)
+
+    def test_diff_judge_empty_patch_result_ties_when_both_empty(self):
+        result = _diff_judge_empty_patch_result(
+            king_patch=" \n",
+            challenger_patch="",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.winner, "tie")
+        self.assertEqual(result.king_score, 0.0)
+        self.assertEqual(result.challenger_score, 0.0)
+
+    def test_diff_judge_empty_patch_result_allows_both_nonempty(self):
+        result = _diff_judge_empty_patch_result(
+            king_patch="diff --git a/k b/k\n+king\n",
+            challenger_patch="diff --git a/c b/c\n+challenger\n",
+        )
+
+        self.assertIsNone(result)
+
+    def test_judge_round_diffs_skips_llm_for_empty_challenger_patch(self):
+        calls = []
+
+        def fake_complete_text(**kwargs):
+            calls.append(kwargs)
+            raise AssertionError("LLM judge should not run for empty patches")
+
+        task_paths = SimpleNamespace(
+            task_txt_path=SimpleNamespace(read_text=lambda: "fix the bug"),
+            reference_patch_path=SimpleNamespace(read_text=lambda: "diff --git a/ref b/ref"),
+        )
+
+        def fake_solution_paths(_task_paths, solution_name):
+            patch = "diff --git a/king b/king\n+fix\n" if solution_name == "king" else "\n"
+            return SimpleNamespace(
+                solution_diff_path=SimpleNamespace(read_text=lambda p=patch: p),
+            )
+
+        with (
+            patch("validate.resolve_task_paths", return_value=task_paths),
+            patch("validate.resolve_solution_paths", side_effect=fake_solution_paths),
+            patch("validate.complete_text", side_effect=fake_complete_text),
+        ):
+            result = validate._judge_round_diffs(
+                task_name="task-judge",
+                challenger_solution_name="challenger-7-d3",
+                config=RunConfig(openrouter_api_key="test-key"),
+                duel_id=6861,
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result.winner, "king")
+        self.assertEqual(result.king_score, 1.0)
+        self.assertEqual(result.challenger_score, 0.0)
+        self.assertEqual(result.outcome, "empty_patch")
 
     def test_diff_judge_static_prompt_injection_loses_round_score(self):
         result = _diff_judge_prompt_injection_result(
