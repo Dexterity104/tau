@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import r2
 import validate
 from config import RunConfig
 from validate import PoolTask, TaskPool, _prepare_validate_paths
@@ -68,7 +69,7 @@ class TaskPoolTest(unittest.TestCase):
         payload = validate._active_rounds_payload([scored])[0]
 
         self.assertIn("LLM judge verdict: CHALLENGER.", payload["llm_judge_rationale"])
-        self.assertIn(validate._ACTIVE_DUEL_JUDGE_RATIONALE_WITHHELD, payload["llm_judge_rationale"])
+        self.assertIn(r2._PUBLIC_JUDGE_RATIONALE_WITHHELD, payload["llm_judge_rationale"])
         self.assertNotIn("Markdown", payload["llm_judge_rationale"])
         self.assertNotIn("plain text", payload["llm_judge_rationale"])
 

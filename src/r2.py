@@ -300,6 +300,40 @@ def _is_task_error_round_dict(round_dict: dict[str, Any] | None) -> bool:
     return error.startswith("task_error:")
 
 
+_PUBLIC_JUDGE_RATIONALE_WITHHELD = "Detailed judge rationale withheld from public dashboard."
+
+
+def public_judge_rationale(
+    *,
+    rationale: str | None,
+    llm_judge_winner: str | None,
+) -> str | None:
+    """Return a censored judge note for public R2/dashboard payloads."""
+    if not rationale:
+        return None
+    winner = str(llm_judge_winner or "tie").strip().lower()
+    if winner not in {"king", "challenger", "tie"}:
+        winner = "tie"
+    return f"LLM judge verdict: {winner.upper()}. {_PUBLIC_JUDGE_RATIONALE_WITHHELD}"
+
+
+def _public_round_judge_rationale(round_dict: dict[str, Any]) -> str | None:
+    return public_judge_rationale(
+        rationale=round_dict.get("llm_judge_rationale"),
+        llm_judge_winner=round_dict.get("llm_judge_winner") or round_dict.get("winner"),
+    )
+
+
+def _sanitize_public_round_dict(round_dict: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(round_dict)
+    censored = _public_round_judge_rationale(round_dict)
+    if censored is not None:
+        sanitized["llm_judge_rationale"] = censored
+    elif "llm_judge_rationale" in sanitized:
+        sanitized.pop("llm_judge_rationale")
+    return sanitized
+
+
 def _dashboard_duel_summary(source: dict[str, Any]) -> dict[str, Any]:
     summary = _copy_fields(source, (
         "duel_id", "started_at", "finished_at", "king_replaced", "disqualification_reason",
@@ -763,7 +797,7 @@ def duel_to_summary(duel_dict: dict[str, Any]) -> dict[str, Any]:
                 "llm_judge_winner": (
                     "tie" if _is_task_error_round_dict(r) else r.get("llm_judge_winner", "tie")
                 ),
-                "llm_judge_rationale": r.get("llm_judge_rationale"),
+                "llm_judge_rationale": _public_round_judge_rationale(r),
                 "task_error": (
                     r.get("task_error") or r.get("error")
                     if _is_task_error_round_dict(r)
@@ -818,18 +852,17 @@ def _public_duel_payload(duel_dict: dict[str, Any]) -> dict[str, Any]:
         for item in raw_rounds:
             if not isinstance(item, dict):
                 continue
-            rounds.append(
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key
-                    not in {
-                        "challenger_compare_root",
-                        "king_compare_root",
-                        "task_root",
-                    }
+            round_payload = {
+                key: value
+                for key, value in item.items()
+                if key
+                not in {
+                    "challenger_compare_root",
+                    "king_compare_root",
+                    "task_root",
                 }
-            )
+            }
+            rounds.append(_sanitize_public_round_dict(round_payload))
     public_payload["rounds"] = rounds
     return public_payload
 

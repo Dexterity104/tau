@@ -229,7 +229,7 @@ class R2PublicSanitizationTest(unittest.TestCase):
         self.assertNotIn("challenger_compare_root", round_payload)
         self.assertEqual(
             round_payload["llm_judge_rationale"],
-            "King wins because the implementation handles validation; challenger misses the error path.",
+            "LLM judge verdict: KING. Detailed judge rationale withheld from public dashboard.",
         )
         self.assertEqual(round_payload["king_score"], 0.8)
 
@@ -259,7 +259,7 @@ class R2PublicSanitizationTest(unittest.TestCase):
             "task_error: provider_endpoint_error (challenger)",
         )
 
-    def test_duel_summary_keeps_public_judge_rationale(self):
+    def test_duel_summary_censors_public_judge_rationale(self):
         summary = duel_to_summary(
             {
                 "duel_id": 12,
@@ -271,6 +271,7 @@ class R2PublicSanitizationTest(unittest.TestCase):
                         "winner": "king",
                         "error": None,
                         "llm_judge_rationale": "King handles validation; challenger misses the error path.",
+                        "llm_judge_winner": "king",
                         "king_score": 0.8,
                     }
                 ],
@@ -279,8 +280,9 @@ class R2PublicSanitizationTest(unittest.TestCase):
 
         self.assertEqual(
             summary["rounds"][0]["llm_judge_rationale"],
-            "King handles validation; challenger misses the error path.",
+            "LLM judge verdict: KING. Detailed judge rationale withheld from public dashboard.",
         )
+        self.assertNotIn("King handles validation", summary["rounds"][0]["llm_judge_rationale"])
 
     def test_duel_summary_marks_confirmation_retests(self):
         summary = duel_to_summary(
