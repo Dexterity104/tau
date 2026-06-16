@@ -46,6 +46,32 @@ class TaskPoolTest(unittest.TestCase):
         self.assertEqual([item["task_name"] for item in payload], ["task-scored"])
         self.assertEqual(payload[0]["winner"], "king")
 
+    def test_active_rounds_payload_censors_judge_rationale(self):
+        scored = validate.ValidationRoundResult(
+            task_name="task-scored",
+            winner="challenger",
+            king_lines=3,
+            challenger_lines=1,
+            king_similarity_ratio=0.8,
+            challenger_similarity_ratio=0.4,
+            king_challenger_similarity=0.2,
+            llm_judge_winner="challenger",
+            llm_judge_rationale=(
+                "Challenger correctly implements all requirements: user messages remain plain text, "
+                "assistant messages render Markdown and LaTeX."
+            ),
+            task_root="/tmp/task-scored",
+            king_compare_root="",
+            challenger_compare_root="",
+        )
+
+        payload = validate._active_rounds_payload([scored])[0]
+
+        self.assertIn("LLM judge verdict: CHALLENGER.", payload["llm_judge_rationale"])
+        self.assertIn(validate._ACTIVE_DUEL_JUDGE_RATIONALE_WITHHELD, payload["llm_judge_rationale"])
+        self.assertNotIn("Markdown", payload["llm_judge_rationale"])
+        self.assertNotIn("plain text", payload["llm_judge_rationale"])
+
 
     def test_provider_endpoint_round_error_counts_as_scored_tie(self):
         task = PoolTask(

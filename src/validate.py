@@ -3206,6 +3206,21 @@ def _gather_pool_tasks(
     return _order_duel_tasks_for_submission(tasks)
 
 
+_ACTIVE_DUEL_JUDGE_RATIONALE_WITHHELD = "Detailed judge rationale withheld during live duel."
+
+
+def _public_active_duel_judge_rationale(
+    rationale: str,
+    *,
+    llm_judge_winner: str,
+) -> str:
+    """Return a heavily censored judge note for in-progress duel dashboard payloads."""
+    winner = str(llm_judge_winner or "tie").strip().lower()
+    if winner not in {"king", "challenger", "tie"}:
+        winner = "tie"
+    return f"LLM judge verdict: {winner.upper()}. {_ACTIVE_DUEL_JUDGE_RATIONALE_WITHHELD}"
+
+
 def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]:
     payload = {
         "task_name": round_result.task_name,
@@ -3230,7 +3245,10 @@ def _active_round_payload(round_result: ValidationRoundResult) -> dict[str, Any]
     if round_result.error:
         payload["error"] = round_result.error
     if round_result.llm_judge_rationale:
-        payload["llm_judge_rationale"] = round_result.llm_judge_rationale
+        payload["llm_judge_rationale"] = _public_active_duel_judge_rationale(
+            round_result.llm_judge_rationale,
+            llm_judge_winner=round_result.llm_judge_winner,
+        )
     return payload
 
 
