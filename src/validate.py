@@ -4298,6 +4298,17 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
             force=force or wakeup_changed,
             last_refresh_at=last_submission_refresh_at,
         ):
+            if wakeup_changed and paths.state_path.exists():
+                try:
+                    disk_state = _load_state(paths.state_path)
+                    merged = _merge_queued_submissions_from_disk_state(state, disk_state)
+                    if merged:
+                        log.info(
+                            "Wakeup merged %d queued submission(s) from state.json before refresh",
+                            merged,
+                        )
+                except Exception:
+                    log.exception("Failed to merge queued submissions from disk on wakeup (non-fatal)")
             queue_before = [submission.to_dict() for submission in state.queue]
             chain_submissions = _fetch_private_api_submissions(
                 subtensor=subtensor,
@@ -5213,6 +5224,20 @@ def validate_loop_run(config: RunConfig) -> ValidateStageResult:
                                 or inner_wakeup_mtime > last_private_submission_wakeup_mtime
                             )
                         )
+                        if inner_wakeup_changed:
+                            try:
+                                disk_state = _load_state(paths.state_path)
+                                merged = _merge_queued_submissions_from_disk_state(state, disk_state)
+                                if merged:
+                                    log.info(
+                                        "Merged %d queued submission(s) from state.json during duel drain",
+                                        merged,
+                                    )
+                                    last_private_submission_wakeup_mtime = inner_wakeup_mtime
+                            except Exception:
+                                log.exception(
+                                    "Failed to merge queued submissions from disk during duel drain (non-fatal)"
+                                )
                         if _should_refresh_private_submissions(
                             config=config,
                             force=inner_wakeup_changed,
@@ -8141,8 +8166,54 @@ def _reconcile_state_with_duel_history(
         )
     return changed
 
+def _merge_queued_submissions_from_disk_state(
+    state: ValidatorState,
+    disk: ValidatorState,
+) -> int:
+    """Pull queue entries written by submissions-api into in-memory validator state."""
+    memory_commitments = {submission.commitment for submission in state.queue}
+    memory_hotkeys = {submission.hotkey for submission in state.queue}
+    added = 0
+    for submission in disk.queue:
+        if submission.commitment in memory_commitments:
+            continue
+        if submission.hotkey in memory_hotkeys:
+            continue
+        if state.active_duel is not None and submission.hotkey in {
+            state.active_duel.king.hotkey,
+            state.active_duel.challenger.hotkey,
+        }:
+            continue
+        if state.current_king is not None and submission.hotkey == state.current_king.hotkey:
+            continue
+        locked = state.locked_commitments.get(submission.hotkey)
+        if locked is not None and locked != submission.commitment:
+            continue
+        _clear_stale_spent_state_for_reregistered_hotkey(
+            state,
+            hotkey=submission.hotkey,
+            registration_block=submission.commitment_block,
+        )
+        _record_commitment_acceptance(state, submission)
+        state.queue.append(submission)
+        memory_commitments.add(submission.commitment)
+        memory_hotkeys.add(submission.hotkey)
+        added += 1
+    if added:
+        state.queue = _sorted_submission_queue(state.queue)
+    return added
+
+
 def _save_state(path: Path, state: ValidatorState) -> None:
-    write_json(path, state.to_dict())
+    from validator_state_io import validator_state_lock
+
+    with validator_state_lock(path):
+        if path.exists():
+            disk = _load_state(path)
+            merged = _merge_queued_submissions_from_disk_state(state, disk)
+            if merged:
+                log.info("Merged %d queued submission(s) from disk before save", merged)
+        write_json(path, state.to_dict())
 
 def _write_duel(paths: ValidatePaths, duel: DuelResult) -> None:
     write_json(paths.duels_dir / f"{duel.duel_id:06d}.json", duel.to_dict())
