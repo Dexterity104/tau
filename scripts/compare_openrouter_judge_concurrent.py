@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from openrouter_client import complete_text
+from sampling_seed import deterministic_sampling_seed, judge_seed_material
 from validate import (
     _DIFF_JUDGE_ATTEMPTS,
     _DIFF_JUDGE_MAX_PATCH_CHARS,
@@ -21,6 +22,7 @@ from validate import (
     _diff_judge_candidate_mapping,
     _diff_judge_candidate_patches,
     _diff_judge_prompt_injection_result,
+    _diff_judge_reasoning_for_model,
     _extract_json_object,
     _neutral_diff_judge,
     _parse_diff_judge_payload,
@@ -93,6 +95,16 @@ def judge_with_model(*, round_payload: dict[str, Any], model: str, api_key: str)
         )
         last_error = None
         result = None
+        seed = deterministic_sampling_seed(
+            configured=None,
+            material=judge_seed_material(
+                task_name=task_name,
+                model=model,
+                king_patch=king_patch,
+                challenger_patch=challenger_patch,
+            ),
+        )
+        reasoning = _diff_judge_reasoning_for_model(model)
         for attempt in range(1, _DIFF_JUDGE_ATTEMPTS + 1):
             try:
                 raw = complete_text(
@@ -103,8 +115,9 @@ def judge_with_model(*, round_payload: dict[str, Any], model: str, api_key: str)
                     openrouter_api_key=api_key,
                     temperature=0,
                     top_p=1,
+                    seed=seed,
                     max_tokens=_DIFF_JUDGE_MAX_TOKENS,
-                    reasoning=None,
+                    reasoning=reasoning,
                 )
                 payload = _extract_json_object(raw)
                 if payload is None:

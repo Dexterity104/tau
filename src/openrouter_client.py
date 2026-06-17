@@ -34,6 +34,8 @@ class HttpxLLMClient(LLMClient):
             payload["top_p"] = request.top_p
         if request.max_tokens is not None:
             payload["max_tokens"] = request.max_tokens
+        if request.seed is not None:
+            payload["seed"] = request.seed
         if request.reasoning is not None:
             payload["reasoning"] = request.reasoning
         if request.cache_control is not None:
@@ -88,6 +90,7 @@ def complete_text(
     temperature: float | None = None,
     top_p: float | None = None,
     max_tokens: int | None = None,
+    seed: int | None = None,
     reasoning: dict[str, Any] | None = None,
     cache_control: dict[str, Any] | None = None,
     rate_limit_retries: int = 1,
@@ -99,6 +102,7 @@ def complete_text(
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
+        seed=seed,
         reasoning=reasoning,
         cache_control=cache_control,
     )

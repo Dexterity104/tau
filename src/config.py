@@ -190,6 +190,12 @@ class RunConfig:
     solver_temperature: float | None = field(
         default_factory=lambda: _env_float("SOLVER_TEMPERATURE", "OPENROUTER_SOLVER_TEMPERATURE"),
     )
+    solver_seed: int | None = field(
+        default_factory=lambda: _env_int("TAU_SOLVER_SEED", "SOLVER_SEED"),
+    )
+    llm_judge_seed: int | None = field(
+        default_factory=lambda: _env_int("TAU_LLM_JUDGE_SEED", "LLM_JUDGE_SEED", "LLM_SEED"),
+    )
     solver_proxy_cache_dir: Path | None = field(
         default_factory=lambda: (
             Path(value).expanduser() if (value := os.environ.get("PROXY_CACHE_DIR")) else None

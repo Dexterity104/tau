@@ -95,6 +95,8 @@ _DIFF_JUDGE_TIMEOUT_SECONDS = 120
 _DIFF_JUDGE_TOTAL_TIMEOUT_SECONDS = 300
 _DIFF_JUDGE_MAX_TOKENS = 16_000
 _DIFF_JUDGE_REASONING = {"enabled": True, "exclude": True}
+# MiniMax defaults to medium reasoning on OpenRouter when omitted; disable for judge latency.
+_MINIMAX_DIFF_JUDGE_REASONING = {"effort": "none", "exclude": True}
 _DIFF_JUDGE_MAX_PATCH_CHARS = 60_000
 _DIFF_JUDGE_MAX_TASK_CHARS = 20_000
 _DIFF_JUDGE_ATTEMPTS = 4
@@ -1862,6 +1864,17 @@ def _judge_round_diffs_uncapped(
             challenger_patch=challenger_patch,
             candidate_mapping=candidate_mapping,
         )
+        from sampling_seed import deterministic_sampling_seed, judge_seed_material
+
+        judge_seed = deterministic_sampling_seed(
+            configured=config.llm_judge_seed,
+            material=judge_seed_material(
+                task_name=task_name,
+                model=model,
+                king_patch=king_patch,
+                challenger_patch=challenger_patch,
+            ),
+        )
         prompt = _diff_judge_prompt_for_model(
             model=model,
             task_prompt=task_prompt,
@@ -1934,6 +1947,7 @@ def _judge_round_diffs_uncapped(
                         openrouter_api_key=config.openrouter_api_key,
                         temperature=0,
                         top_p=1,
+                        seed=judge_seed,
                         max_tokens=_DIFF_JUDGE_MAX_TOKENS,
                         reasoning=reasoning,
                         rate_limit_retries=resolve_rate_limit_retries(
@@ -2062,6 +2076,8 @@ def _diff_judge_prompt_for_model(
 def _diff_judge_reasoning_for_model(model: str) -> dict[str, Any] | None:
     if model.startswith("anthropic/"):
         return _DIFF_JUDGE_REASONING
+    if model.startswith("minimax/"):
+        return _MINIMAX_DIFF_JUDGE_REASONING
     return None
 
 
@@ -2104,6 +2120,11 @@ def _diff_judge_instruction_text() -> str:
 
 
 def _diff_judge_candidate_mapping(*, seed: str) -> dict[str, str]:
+    """Map king/challenger to blinded candidate_a/b slots.
+
+    The seed is per task + challenger solution label + judge model, so A/B order
+    varies across tasks within a duel rather than being fixed for the whole duel.
+    """
     digest = hashlib.sha256(seed.encode("utf-8")).digest()
     if digest[0] % 2 == 0:
         return {"king": "candidate_a", "challenger": "candidate_b"}

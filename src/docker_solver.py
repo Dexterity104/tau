@@ -280,7 +280,12 @@ def solve_task_in_docker(
             unix_socket_path=proxy_transport.unix_socket_path,
             enforced_model=model_id,
             enforced_provider=_solver_provider_preferences(config),
-            enforced_sampling_params=_solver_enforced_sampling_params(config),
+            enforced_sampling_params=_solver_enforced_sampling_params(
+                config,
+                task_name=task_name or run_label or "unknown-task",
+                solution_name=solution_name or run_label or "solution",
+                agent_hash=agent_hash,
+            ),
             upstream_request_policy=config.solver_upstream_request_policy,
             require_auth=True,
             rollout_event_sink=_append_rollout_event if config.record_rollouts else None,
@@ -1393,9 +1398,28 @@ def _split_provider_slugs(raw: str | None) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-def _solver_enforced_sampling_params(config: RunConfig) -> dict[str, Any]:
+def _solver_enforced_sampling_params(
+    config: RunConfig,
+    *,
+    task_name: str,
+    solution_name: str,
+    agent_hash: str,
+) -> dict[str, Any]:
+    from sampling_seed import deterministic_sampling_seed, solver_seed_material
+
     temperature = config.solver_temperature if config.solver_temperature is not None else 0.0
-    return {"temperature": temperature, "top_p": 1.0}
+    return {
+        "temperature": temperature,
+        "top_p": 1.0,
+        "seed": deterministic_sampling_seed(
+            configured=config.solver_seed,
+            material=solver_seed_material(
+                task_name=task_name,
+                solution_name=solution_name,
+                agent_hash=agent_hash,
+            ),
+        ),
+    }
 
 
 def _solver_provider_preferences(config: RunConfig) -> dict[str, Any] | None:

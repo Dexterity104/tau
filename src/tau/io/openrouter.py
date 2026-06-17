@@ -20,6 +20,7 @@ class LLMRequest:
     temperature: float | None = None
     top_p: float | None = None
     max_tokens: int | None = None
+    seed: int | None = None
     reasoning: dict[str, Any] | None = None
     cache_control: dict[str, Any] | None = None
 
@@ -31,6 +32,7 @@ class LLMRequest:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
+            "seed": self.seed,
             "reasoning": self.reasoning,
             "cache_control": self.cache_control,
         })

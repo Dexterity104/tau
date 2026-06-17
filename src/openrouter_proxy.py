@@ -46,6 +46,7 @@ _ALLOWED_PATHS = {"/v1/chat/completions", "/v1/messages"}
 _VALIDATOR_SAMPLING_PARAMS = {
     "temperature": 0.0,
     "top_p": 1.0,
+    # seed is injected per solve via enforced_sampling_params in docker_solver.
 }
 _MINER_CONTROLLED_SAMPLING_PARAMS = {
     "top_k",
