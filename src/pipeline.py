@@ -9,7 +9,12 @@ from pathlib import Path
 
 from compare import compare_solution_repos
 from config import RunConfig
-from docker_solver import _agent_source_sha256, solve_task_in_docker
+from docker_solver import (
+    _RESERVED_OVERLAY_SOLUTION_NAMES,
+    _agent_source_sha256,
+    docker_overlay_repo_enabled,
+    solve_task_in_docker,
+)
 from eval import evaluate_candidate_pair
 from github_miner import GitHubMiner, GitHubTokenRotator, miner_reject_cache_path
 from solver_runner import solve_task, solve_task_claw
@@ -157,11 +162,26 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
     task_paths = resolve_task_paths(config.tasks_root, task_name)
     candidate = load_commit_candidate(task_paths)
     task = load_generated_task(task_paths)
-    solution_paths = prepare_solution_workspace(task_paths, solution_name)
+
+    # Overlay repo provisioning replaces the per-solution copytree with a shared
+    # on-disk base + per-solve overlay (see docker_solver). Reserved solutions
+    # (king/reference) keep the copy path: they are solved once and their cache
+    # path expects a persistent repo dir. The hot per-round challenger does not.
+    use_overlay_repo = (
+        config.use_docker_solver
+        and solution_name not in _RESERVED_OVERLAY_SOLUTION_NAMES
+        and docker_overlay_repo_enabled(config)
+    )
+    solution_paths = prepare_solution_workspace(
+        task_paths, solution_name, copy_repo=not use_overlay_repo
+    )
+    docker_repo_dir = (
+        task_paths.original_dir if use_overlay_repo else solution_paths.repo_dir
+    )
 
     if config.use_docker_solver:
         solve_result = solve_task_in_docker(
-            repo_dir=solution_paths.repo_dir,
+            repo_dir=docker_repo_dir,
             task=task,
             model=config.solver_model,
             timeout=config.agent_timeout,
@@ -171,6 +191,7 @@ def solve_task_run(*, task_name: str, solution_name: str, config: RunConfig) -> 
             solution_name=solution_name,
             repo_full_name=candidate.repo_full_name,
             commit_sha=candidate.commit_sha,
+            use_overlay_repo=use_overlay_repo,
         )
     elif config.use_claw_solver:
         solve_result = solve_task_claw(

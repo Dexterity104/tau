@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -24,6 +25,7 @@ class HttpxLLMClient(LLMClient):
         self._api_key = api_key
 
     def complete_text(self, request: LLMRequest, *, timeout: int) -> str:
+        url, api_key, self_hosted = _route_request(request.model, self._api_key)
         payload: dict[str, Any] = {
             "model": _resolve_model(request.model),
             "messages": _build_messages(system_prompt=request.system_prompt, prompt=request.prompt),
@@ -40,17 +42,24 @@ class HttpxLLMClient(LLMClient):
             payload["reasoning"] = request.reasoning
         if request.cache_control is not None:
             payload["cache_control"] = request.cache_control
-        provider = _provider_preferences_from_env()
-        if provider is not None:
-            payload["provider"] = provider
+        if self_hosted:
+            # Self-hosted Qwen endpoints default to thinking ON; disable it for
+            # determinism + speed (override via SOLVER_CHAT_TEMPLATE_KWARGS).
+            payload["chat_template_kwargs"] = _self_hosted_template_kwargs()
+        else:
+            # Provider routing is OpenRouter-only; a self-hosted vLLM endpoint
+            # rejects/ignores it.
+            provider = _provider_preferences_from_env()
+            if provider is not None:
+                payload["provider"] = provider
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "X-Title": "swe-eval",
         }
-        log.debug("Calling OpenRouter model=%s timeout=%ss", payload["model"], timeout)
+        log.debug("Calling model=%s self_hosted=%s timeout=%ss", payload["model"], self_hosted, timeout)
         with httpx.Client(timeout=timeout) as client:
-            response = client.post(_openrouter_url(), headers=headers, json=payload)
+            response = client.post(url, headers=headers, json=payload)
             response.raise_for_status()
         data = response.json()
         choices = data.get("choices") or []
@@ -184,6 +193,32 @@ def _openrouter_url() -> str:
         )
         + "/v1/chat/completions"
     )
+
+
+def _self_hosted_template_kwargs() -> dict[str, Any]:
+    raw = os.environ.get("SOLVER_CHAT_TEMPLATE_KWARGS")
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception:
+            log.warning("Ignoring invalid SOLVER_CHAT_TEMPLATE_KWARGS: %r", raw)
+    return {"enable_thinking": False}
+
+
+def _route_request(model: str | None, default_key: str) -> tuple[str, str, bool]:
+    """Pick (chat-completions URL, api_key, is_self_hosted) for a model.
+
+    The model named by SELF_HOSTED_MODEL routes to the self-hosted solver
+    endpoint (SOLVER_UPSTREAM_BASE_URL + SOLVER_UPSTREAM_API_KEY); every other
+    model (e.g. the glm-5.2 judges) goes to OpenRouter with the default key. This
+    lets generator/eval share the self-hosted endpoint while judges use OpenRouter.
+    """
+    self_hosted_model = os.environ.get("SELF_HOSTED_MODEL")
+    base = os.environ.get("SOLVER_UPSTREAM_BASE_URL")
+    if self_hosted_model and base and model and _resolve_model(model) == _resolve_model(self_hosted_model):
+        url = normalize_base_url(base) + "/v1/chat/completions"
+        return url, (os.environ.get("SOLVER_UPSTREAM_API_KEY") or default_key), True
+    return _openrouter_url(), default_key, False
 
 
 def _resolve_model(model: str | None) -> str:

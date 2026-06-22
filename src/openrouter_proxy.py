@@ -79,8 +79,13 @@ _HOP_BY_HOP_HEADERS = {
 
 
 def _upstream_base_url() -> str:
+    # SOLVER_UPSTREAM_BASE_URL lets the solver proxy target a different backend
+    # (e.g. a self-hosted vLLM endpoint) than the judge, which keeps using
+    # OPENROUTER_UPSTREAM_BASE_URL/OPENROUTER_BASE_URL via its separate client.
     return normalize_base_url(
-        os.environ.get("OPENROUTER_UPSTREAM_BASE_URL") or os.environ.get("OPENROUTER_BASE_URL"),
+        os.environ.get("SOLVER_UPSTREAM_BASE_URL")
+        or os.environ.get("OPENROUTER_UPSTREAM_BASE_URL")
+        or os.environ.get("OPENROUTER_BASE_URL"),
     )
 
 

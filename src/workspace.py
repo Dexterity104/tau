@@ -234,14 +234,20 @@ def materialize_task_workspace(tasks_root: Path, task_name: str, candidate: Comm
     return task_paths
 
 
-def prepare_solution_workspace(task_paths: TaskPaths, solution_name: str) -> SolutionPaths:
+def prepare_solution_workspace(
+    task_paths: TaskPaths, solution_name: str, *, copy_repo: bool = True
+) -> SolutionPaths:
     solution_paths = build_solution_paths(task_paths, solution_name)
     if solution_paths.root.exists():
         raise FileExistsError(
             f"Solution {solution_name!r} already exists for task {task_paths.name!r} at {solution_paths.root}",
         )
     solution_paths.root.mkdir(parents=True, exist_ok=False)
-    shutil.copytree(task_paths.original_dir, solution_paths.repo_dir, symlinks=True)
+    # The Docker overlay solver mounts a shared base instead of a per-solution
+    # copy, so skip the (expensive, per-round) copytree when it is not needed.
+    # The repo is rebuilt from the saved diff on demand (ensure_solution_repo_from_diff).
+    if copy_repo:
+        shutil.copytree(task_paths.original_dir, solution_paths.repo_dir, symlinks=True)
     return solution_paths
 
 
