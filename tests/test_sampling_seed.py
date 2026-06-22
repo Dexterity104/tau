@@ -7,12 +7,12 @@ from tau.io.openrouter import LLMRequest
 
 
 class SamplingSeedTest(unittest.TestCase):
-    def test_deterministic_material_is_stable(self):
+    def test_seed_is_constant_42_ignoring_material(self):
+        # The seed is a flat constant 42 (irrelevant at temp 0); material is ignored.
         a = deterministic_sampling_seed(configured=None, material="judge:task:model:abc")
-        b = deterministic_sampling_seed(configured=None, material="judge:task:model:abc")
         c = deterministic_sampling_seed(configured=None, material="judge:task:model:xyz")
-        self.assertEqual(a, b)
-        self.assertNotEqual(a, c)
+        self.assertEqual(a, 42)
+        self.assertEqual(a, c)
 
     def test_configured_seed_overrides_material(self):
         self.assertEqual(

@@ -85,6 +85,23 @@ WORKDIR /work
 CMD ["bash"]
 """
 
+_SORTDIR_SOURCE_PATH = Path(__file__).resolve().parent / "sortdir.c"
+
+
+def _sortdir_source() -> str:
+    """C source for the deterministic-readdir LD_PRELOAD shim, compiled into each image."""
+    return _SORTDIR_SOURCE_PATH.read_text()
+
+
+# Appended to every solver Dockerfile: compiles sortdir.c -> /opt/tau/libsortdir.so,
+# which the agent launch env LD_PRELOADs so find/ls/glob/os.listdir read in sorted
+# (deterministic) order. gcc is left in place since language images need a toolchain.
+_SORTDIR_LAYER = """
+COPY sortdir.c /opt/tau/sortdir.c
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && gcc -O2 -shared -fPIC -o /opt/tau/libsortdir.so /opt/tau/sortdir.c -ldl -lpthread && rm -rf /var/lib/apt/lists/*
+"""
+
+
 _LANGUAGE_MANIFEST_FILES = (
     ("node", ("package.json",)),
     ("go", ("go.mod",)),
@@ -108,8 +125,10 @@ def _dockerfile_for_language(language: str) -> str:
     base = _LANGUAGE_BASE_IMAGES.get(language)
     if base is None:
         # python / unknown -> the original slim Python image (cache-preserving).
-        return _DOCKERFILE_TEMPLATE
-    return f"FROM {base}\n\n{_HARNESS_LAYER}"
+        dockerfile = _DOCKERFILE_TEMPLATE
+    else:
+        dockerfile = f"FROM {base}\n\n{_HARNESS_LAYER}"
+    return dockerfile + _SORTDIR_LAYER
 
 
 def _list_repo_files(repo_dir: Path, *, cap: int = 4000) -> list[str]:
@@ -228,6 +247,7 @@ def solve_task_in_docker(
     solution_name: str | None = None,
     repo_full_name: str | None = None,
     commit_sha: str | None = None,
+    use_overlay_repo: bool = False,
 ) -> SolveResult:
     if not config.openrouter_api_key:
         raise RuntimeError(
@@ -242,6 +262,7 @@ def solve_task_in_docker(
 
     start = time.monotonic()
     container_id: str | None = None
+    overlay_mount: _OverlayMount | None = None
     container_force_killed = False
     solver_run = _DockerSolverCommandResult(returncode=1, stdout="", stderr="")
     solution_diff = ""
@@ -273,8 +294,14 @@ def solve_task_in_docker(
                 rollout_events.append(event)
 
         proxy_transport = _resolve_proxy_transport(proxy_socket_dir=Path(proxy_socket_dir))
+        proxy_cache_dir = config.solver_proxy_replay_dir or config.solver_proxy_cache_dir
         with OpenRouterProxy(
-            openrouter_api_key=config.openrouter_api_key,
+            # The proxy authenticates to the SOLVER upstream. When the solver
+            # targets a self-hosted endpoint (SOLVER_UPSTREAM_BASE_URL), use its
+            # key; otherwise the OpenRouter key. The judge uses its own key.
+            openrouter_api_key=(
+                os.environ.get("SOLVER_UPSTREAM_API_KEY") or config.openrouter_api_key
+            ),
             solve_budget=budget,
             bind_host=proxy_transport.bind_host,
             unix_socket_path=proxy_transport.unix_socket_path,
@@ -290,6 +317,8 @@ def solve_task_in_docker(
             require_auth=True,
             rollout_event_sink=_append_rollout_event if config.record_rollouts else None,
             rollout_capture_bodies=config.record_rollouts,
+            cache_dir=proxy_cache_dir,
+            cache_replay_only=config.solver_proxy_replay_dir is not None,
         ) as proxy:
             sensitive_values = _sensitive_values(config=config, proxy=proxy)
             try:
@@ -311,14 +340,32 @@ def solve_task_in_docker(
                     language = "python"
                     image_tag = _resolve_image_tag(config, "python")
                     _build_image(image_tag=image_tag, config=config, language="python")
+                repo_bind_source: str | None = None
+                if use_overlay_repo:
+                    base_repo = _ensure_overlay_base(
+                        source_dir=repo_dir,
+                        key=_overlay_base_key(
+                            source_dir=repo_dir,
+                            repo_full_name=repo_full_name,
+                            commit_sha=commit_sha,
+                        ),
+                    )
+                    overlay_mount = _setup_overlay_mount(
+                        base_repo=base_repo,
+                        label=run_label or solution_name or "solve",
+                        size=config.docker_solver_workdir_size,
+                    )
+                    repo_bind_source = str(overlay_mount.merged)
                 container_id = _start_container(
                     image_tag=image_tag,
                     config=config,
                     run_label=run_label,
                     proxy_transport=proxy_transport,
                     proxy_socket_dir=Path(proxy_socket_dir),
+                    repo_bind_source=repo_bind_source,
                 )
-                _copy_repo_to_container(repo_dir=repo_dir, container_id=container_id)
+                if overlay_mount is None:
+                    _copy_repo_to_container(repo_dir=repo_dir, container_id=container_id)
                 container_agent_file = _copy_agent_source_to_container(
                     agent_root=agent_root,
                     agent_file=agent_file,
@@ -365,7 +412,12 @@ def solve_task_in_docker(
                         solution_diff = _redact_sensitive_text(solution_diff, sensitive_values)
                         _kill_container(container_id)
                         container_force_killed = True
-                        _apply_patch_to_repo(repo_dir=repo_dir, patch_text=solution_diff)
+                        if overlay_mount is None:
+                            # Legacy copy path: reconstruct the solved tree on the
+                            # host copy for the git_diff fallback below. With an
+                            # overlay the merged dir already holds the edits, so
+                            # re-applying would conflict.
+                            _apply_patch_to_repo(repo_dir=repo_dir, patch_text=solution_diff)
             finally:
                 if container_id is not None:
                     if not container_force_killed:
@@ -375,9 +427,17 @@ def solve_task_in_docker(
                     _remove_container(proxy_transport.relay_container_name)
                 if proxy_transport.relay_network_name:
                     _remove_network(proxy_transport.relay_network_name)
+                if overlay_mount is not None:
+                    # Capture the agent's diff from the still-mounted overlay
+                    # before tearing it down (the tail fallback can't reach it).
+                    if not solution_diff:
+                        with contextlib.suppress(Exception):
+                            solution_diff = git_diff(overlay_mount.merged)
+                    overlay_mount.cleanup()
+                    overlay_mount = None
 
     elapsed = time.monotonic() - start
-    if not solution_diff:
+    if not solution_diff and overlay_mount is None and not use_overlay_repo:
         solution_diff = git_diff(repo_dir)
     solution_diff = _redact_sensitive_text(solution_diff, sensitive_values)
     usage_summary = proxy.usage_snapshot()
@@ -492,6 +552,7 @@ def _build_image_locked(*, image_tag: str, config: RunConfig, language: str = "p
         build_path = Path(build_dir)
         dockerfile = _dockerfile_for_language(language)
         (build_path / "Dockerfile").write_text(dockerfile)
+        (build_path / "sortdir.c").write_text(_sortdir_source())
 
         cmd = ["docker", "build", "-t", image_tag]
         if config.docker_solver_no_cache:
@@ -503,6 +564,240 @@ def _build_image_locked(*, image_tag: str, config: RunConfig, language: str = "p
             raise RuntimeError(f"Docker solver image build failed: {output[-500:]}")
 
 
+# ---------------------------------------------------------------------------
+# Overlay-backed repo provisioning (memory-bound IO fix)
+#
+# The default path tars the whole task repo into the container's /work tmpfs
+# (RAM) once per solve. Because the rootfs is read-only, /work must be a tmpfs,
+# so at duel concurrency this pins (rounds x repo_size) of non-evictable RAM and
+# re-copies the same tree every round -- the "memory bound IO" that makes the
+# solve phase crawl in prod even though the judge is one cheap call.
+#
+# Instead: build a sanitized, read-only base ONCE per task on disk, then give
+# each solve an overlayfs whose lower is that shared base (disk-backed, so the
+# page cache is shared across all concurrent solves and evictable) and whose
+# upper is a small, size-capped per-solve tmpfs holding only the agent's edits.
+# The merged dir is bind-mounted into the still-fully-hardened container at
+# /work/repo. All sandbox flags are unchanged: the mount is set up host-side and
+# the container gains no capability from it.
+# ---------------------------------------------------------------------------
+
+_OVERLAY_BASES_ROOT = _SHARED_DOCKER_TEMP_ROOT / "overlay-bases"
+_OVERLAY_MOUNTS_ROOT = _SHARED_DOCKER_TEMP_ROOT / "overlay-mounts"
+_OVERLAY_BASE_KEEP = int(os.environ.get("TAU_DOCKER_OVERLAY_BASE_KEEP", "64"))
+_OVERLAY_BASE_MIN_AGE_SECONDS = float(
+    os.environ.get("TAU_DOCKER_OVERLAY_BASE_MIN_AGE_SECONDS", "3600")
+)
+_RESERVED_OVERLAY_SOLUTION_NAMES = {"king", "reference", "original"}
+
+_overlay_support_lock = threading.Lock()
+_overlay_support_cache: bool | None = None
+
+
+def _umount(path: Path) -> None:
+    """Unmount ``path``, falling back to a lazy detach if it is busy."""
+    if _run(["umount", str(path)], timeout=30, check=False).returncode != 0:
+        _run(["umount", "-l", str(path)], timeout=30, check=False)
+
+
+def _overlay_runtime_supported() -> bool:
+    """Probe (once) whether the host can actually set up the overlay layout.
+
+    Authoritative: mount a throwaway tmpfs+overlay, read back a file, tear it
+    down. Caches the result. Any failure (no privilege, no overlayfs, restricted
+    kernel) returns False so callers transparently use the legacy copy path.
+    Never raises.
+    """
+    global _overlay_support_cache
+    with _overlay_support_lock:
+        if _overlay_support_cache is not None:
+            return _overlay_support_cache
+        supported = False
+        probe_dir: Path | None = None
+        try:
+            _OVERLAY_MOUNTS_ROOT.mkdir(parents=True, exist_ok=True)
+            probe_dir = Path(tempfile.mkdtemp(prefix="ovl-probe-", dir=_OVERLAY_MOUNTS_ROOT))
+            tmpfs_dir = probe_dir / "rw"
+            tmpfs_dir.mkdir()
+            mounted_tmpfs = _run(
+                ["mount", "-t", "tmpfs", "-o", "size=8m", "tmpfs", str(tmpfs_dir)],
+                timeout=20,
+                check=False,
+            ).returncode == 0
+            if mounted_tmpfs:
+                try:
+                    lower = probe_dir / "lower"
+                    lower.mkdir()
+                    (lower / "probe").write_text("ok")
+                    up = tmpfs_dir / "up"
+                    wk = tmpfs_dir / "wk"
+                    mg = tmpfs_dir / "mg"
+                    for d in (up, wk, mg):
+                        d.mkdir()
+                    opts = f"lowerdir={lower},upperdir={up},workdir={wk}"
+                    if _run(
+                        ["mount", "-t", "overlay", "overlay", "-o", opts, str(mg)],
+                        timeout=20,
+                        check=False,
+                    ).returncode == 0:
+                        try:
+                            supported = (mg / "probe").read_text() == "ok"
+                        finally:
+                            _umount(mg)
+                finally:
+                    _umount(tmpfs_dir)
+        except Exception as exc:  # pragma: no cover - environment dependent
+            log.warning("Overlay repo support probe failed; using copy path: %s", exc)
+            supported = False
+        finally:
+            if probe_dir is not None:
+                shutil.rmtree(probe_dir, ignore_errors=True)
+        _overlay_support_cache = supported
+        log.info(
+            "Docker solver overlay repo support: %s",
+            "enabled" if supported else "unavailable",
+        )
+        return supported
+
+
+def docker_overlay_repo_enabled(config: RunConfig) -> bool:
+    """Whether this solve should provision its repo via overlay instead of copy."""
+    mode = (config.docker_solver_overlay_repo or "auto").strip().lower()
+    if mode in {"0", "false", "off", "no"}:
+        return False
+    if mode in {"1", "true", "on", "yes"}:
+        return _overlay_runtime_supported()
+    # "auto": use overlay when the host supports it.
+    return _overlay_runtime_supported()
+
+
+def _overlay_base_key(
+    *, source_dir: Path, repo_full_name: str | None, commit_sha: str | None
+) -> str:
+    """Content key so every solution of the same task shares one base."""
+    if repo_full_name and commit_sha:
+        raw = f"{repo_full_name}@{commit_sha}"
+    else:
+        head = _run(
+            ["git", "-C", str(source_dir), "rev-parse", "HEAD"], timeout=30, check=False
+        )
+        if head.returncode == 0 and head.stdout.strip():
+            raw = f"{source_dir.resolve()}@{head.stdout.strip()}"
+        else:
+            raw = str(source_dir.resolve())
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+@contextlib.contextmanager
+def _overlay_base_lock(key: str):
+    """Serialize building the same base so one solve builds while the rest wait."""
+    _DOCKER_START_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _DOCKER_START_LOCK_DIR / f"tau-overlay-base-{key}.lock"
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _ensure_overlay_base(*, source_dir: Path, key: str) -> Path:
+    """Return a sanitized, read-only base repo dir for ``key``, building once."""
+    base_dir = _OVERLAY_BASES_ROOT / key
+    ready = base_dir / ".ready"
+    repo_path = base_dir / "repo"
+    with _overlay_base_lock(key):
+        if ready.is_file() and repo_path.is_dir():
+            with contextlib.suppress(OSError):
+                os.utime(ready, None)  # mark recently used for pruning
+            return repo_path
+        _OVERLAY_BASES_ROOT.mkdir(parents=True, exist_ok=True)
+        if base_dir.exists():
+            shutil.rmtree(base_dir, ignore_errors=True)
+        tmp_dir = Path(f"{base_dir}.tmp")
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        repo_tmp = tmp_dir / "repo"
+        shutil.copytree(source_dir, repo_tmp, symlinks=True)
+        # Sanitize git metadata once on the host (same script the per-solve copy
+        # path runs in-container), so no per-solve `git gc` is needed.
+        _run(
+            ["bash", "-lc", _git_metadata_sanitize_script(str(repo_tmp))],
+            timeout=300,
+            check=False,
+        )
+        (tmp_dir / ".ready").write_text("1")
+        os.replace(tmp_dir, base_dir)
+    _prune_overlay_bases(current_key=key)
+    return repo_path
+
+
+def _prune_overlay_bases(*, current_key: str) -> None:
+    """Best-effort: drop old bases beyond the keep count (never the in-use one)."""
+    try:
+        if not _OVERLAY_BASES_ROOT.is_dir():
+            return
+        now = time.time()
+        entries: list[tuple[float, Path]] = []
+        for child in _OVERLAY_BASES_ROOT.iterdir():
+            if not child.is_dir() or child.name == current_key:
+                continue
+            marker = child / ".ready"
+            if not marker.is_file():
+                continue
+            entries.append((marker.stat().st_mtime, child))
+        entries.sort(reverse=True)  # newest first
+        for idx, (mtime, child) in enumerate(entries):
+            too_many = idx >= max(0, _OVERLAY_BASE_KEEP - 1)
+            # Only reclaim bases old enough that no in-flight solve can hold them.
+            old_enough = (now - mtime) >= _OVERLAY_BASE_MIN_AGE_SECONDS
+            if too_many and old_enough:
+                shutil.rmtree(child, ignore_errors=True)
+    except Exception as exc:  # pragma: no cover - best effort
+        log.debug("Overlay base prune skipped: %s", exc)
+
+
+@dataclass(slots=True)
+class _OverlayMount:
+    root: Path
+    merged: Path
+    tmpfs: Path
+
+    def cleanup(self) -> None:
+        _umount(self.merged)
+        _umount(self.tmpfs)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+def _setup_overlay_mount(*, base_repo: Path, label: str, size: str) -> _OverlayMount:
+    """Mount a per-solve overlay (shared ro lower + capped tmpfs upper)."""
+    _OVERLAY_MOUNTS_ROOT.mkdir(parents=True, exist_ok=True)
+    safe_label = "".join(c if c.isalnum() or c in "-_" else "-" for c in label)[:40]
+    root = Path(tempfile.mkdtemp(prefix=f"{safe_label}-", dir=_OVERLAY_MOUNTS_ROOT))
+    tmpfs = root / "rw"
+    tmpfs.mkdir()
+    merged = root / "merged"
+    merged.mkdir()
+    try:
+        _run(
+            ["mount", "-t", "tmpfs", "-o", f"size={size},mode=0777", "tmpfs", str(tmpfs)],
+            timeout=30,
+        )
+        up = tmpfs / "up"
+        wk = tmpfs / "wk"
+        up.mkdir()
+        wk.mkdir()
+        opts = f"lowerdir={base_repo},upperdir={up},workdir={wk}"
+        _run(["mount", "-t", "overlay", "overlay", "-o", opts, str(merged)], timeout=30)
+    except Exception:
+        _umount(merged)
+        _umount(tmpfs)
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    return _OverlayMount(root=root, merged=merged, tmpfs=tmpfs)
+
+
 def _start_container(
     *,
     image_tag: str,
@@ -510,6 +805,7 @@ def _start_container(
     run_label: str | None,
     proxy_transport: _DockerProxyTransport,
     proxy_socket_dir: Path,
+    repo_bind_source: str | None = None,
 ) -> str:
     name = _container_name(image_tag, run_label=run_label)
     cmd = [
@@ -536,6 +832,13 @@ def _start_container(
     if proxy_transport.mount_socket_dir:
         cmd.extend(
             ["--mount", f"type=bind,src={proxy_socket_dir},dst={_CONTAINER_PROXY_SOCKET_DIR}"]
+        )
+    if repo_bind_source is not None:
+        # Overlay-provisioned repo: bind the host-side merged overlay dir over
+        # /work/repo (on top of the /work tmpfs). The agent's writes land in the
+        # per-solve tmpfs upper, not a full repo copy in RAM.
+        cmd.extend(
+            ["--mount", f"type=bind,src={repo_bind_source},dst={_CONTAINER_REPO_DIR}"]
         )
     if config.docker_solver_drop_caps:
         cmd.extend(["--cap-drop", "ALL"])
@@ -1047,6 +1350,7 @@ def _resolve_image_tag(config: RunConfig, language: str = "python") -> str:
     digest = hashlib.sha256()
     digest.update(_dockerfile_for_language(language).encode("utf-8"))
     digest.update(_harness_runner_script().encode("utf-8"))
+    digest.update(_sortdir_source().encode("utf-8"))
     return f"swe-eval/file-solver:{digest.hexdigest()[:12]}"
 
 
@@ -1170,12 +1474,14 @@ def _build_solver_command(*, use_proxy_bridge: bool) -> str:
 
 
 def _clean_harness_command() -> str:
+    preload = "" if os.environ.get("TAU_DISABLE_SORTDIR") else "LD_PRELOAD=/opt/tau/libsortdir.so "
     return (
         "env -i "
         "PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin "
         "HOME=/tmp "
         "TMPDIR=/tmp "
         "LANG=C.UTF-8 "
+        + preload +
         "PYTHONUNBUFFERED=1 "
         'TAU_REPO_DIR="$TAU_REPO_DIR" '
         'TAU_PROMPT_FILE="$TAU_PROMPT_FILE" '
@@ -1408,7 +1714,7 @@ def _solver_enforced_sampling_params(
     from sampling_seed import VALIDATOR_TOP_P, deterministic_sampling_seed, solver_seed_material
 
     temperature = config.solver_temperature if config.solver_temperature is not None else 0.0
-    return {
+    params: dict[str, Any] = {
         "temperature": temperature,
         "top_p": VALIDATOR_TOP_P,
         "seed": deterministic_sampling_seed(
@@ -1420,6 +1726,19 @@ def _solver_enforced_sampling_params(
             ),
         ),
     }
+    # Extra body fields forced onto every solver request (e.g. disabling a thinking
+    # template: SOLVER_CHAT_TEMPLATE_KWARGS='{"enable_thinking": false}'). When the
+    # solver targets a self-hosted endpoint (SOLVER_UPSTREAM_BASE_URL), default to
+    # thinking-off — those Qwen endpoints default to thinking ON.
+    extra = os.environ.get("SOLVER_CHAT_TEMPLATE_KWARGS")
+    if not extra and os.environ.get("SOLVER_UPSTREAM_BASE_URL"):
+        extra = '{"enable_thinking": false}'
+    if extra:
+        try:
+            params["chat_template_kwargs"] = json.loads(extra)
+        except Exception:
+            log.warning("Ignoring invalid SOLVER_CHAT_TEMPLATE_KWARGS JSON: %r", extra)
+    return params
 
 
 def _solver_provider_preferences(config: RunConfig) -> dict[str, Any] | None:
@@ -1438,6 +1757,9 @@ def _solver_provider_preferences(config: RunConfig) -> dict[str, Any] | None:
         preferred_min_throughput["p90"] = config.solver_provider_min_throughput_p90
     if preferred_min_throughput:
         provider["preferred_min_throughput"] = preferred_min_throughput
+    quant = os.environ.get("SOLVER_PROVIDER_QUANT") or os.environ.get("OPENROUTER_PROVIDER_QUANT")
+    if quant:
+        provider["quantizations"] = [q.strip() for q in quant.split(",") if q.strip()]
     return provider or None
 
 

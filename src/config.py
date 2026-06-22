@@ -237,6 +237,14 @@ class RunConfig:
     docker_solver_read_only_rootfs: bool = True
     docker_solver_user: str | None = None
     docker_solver_no_cache: bool = False
+    # Repo provisioning for the per-round solve. "auto" uses an overlayfs
+    # (shared on-disk base + per-solve capped tmpfs upper) when the host
+    # supports it, instead of copying the whole repo into /work tmpfs (RAM)
+    # every solve; falls back to the copy path otherwise. "off" forces the
+    # legacy copy path; "on" forces overlay (still requires runtime support).
+    docker_solver_overlay_repo: str = field(
+        default_factory=lambda: os.environ.get("TAU_DOCKER_OVERLAY_REPO", "auto"),
+    )
     validate_netuid: int = 66
     validate_network: str | None = None
     validate_subtensor_endpoint: str | None = None

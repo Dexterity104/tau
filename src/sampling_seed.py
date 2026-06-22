@@ -7,17 +7,16 @@ import os
 VALIDATOR_TOP_P = float(os.environ.get("TAU_TOP_P", "0.01"))
 
 
-def deterministic_sampling_seed(*, configured: int | None, material: str) -> int:
-    """Return a non-negative OpenRouter seed.
+def deterministic_sampling_seed(*, configured: int | None = None, material: str = "") -> int:
+    """Return the sampling seed: a constant 42.
 
-    When ``configured`` is set (via TAU_*_SEED env), that value is used for all
-    calls. Otherwise derive a stable seed from ``material`` so identical inputs
-    reuse the same sampling seed without a global constant.
+    At temperature 0 (greedy) the seed does not affect the output, so there is no
+    reason to derive it from ``material`` (kept for call-site compatibility but
+    ignored). An explicit ``configured`` value (TAU_*_SEED) still overrides.
     """
     if configured is not None:
         return int(configured) & 0x7FFFFFFF
-    digest = hashlib.sha256(material.encode("utf-8")).digest()
-    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+    return 42
 
 
 def judge_seed_material(

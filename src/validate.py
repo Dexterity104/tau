@@ -85,7 +85,7 @@ _BURN_KING_HOTKEY = "burn-uid-0"
 _BURN_KING_COMMITMENT_PREFIX = "burn:uid-0"
 _REFERENCE_SOLUTION_NAME = "reference"
 _LEGACY_BASELINE_SOLUTION_NAME = "baseline"
-_DIFF_JUDGE_MODEL = "google/gemini-3.1-flash-lite"
+_DIFF_JUDGE_MODEL = os.environ.get("TAU_DIFF_JUDGE_MODEL", "google/gemini-3.1-flash-lite")
 _DIFF_JUDGE_FALLBACK_MODELS = ()
 _DIFF_JUDGE_WEIGHT = 1.0
 # Minimum combined round-score gap required to award a side a decisive win.
